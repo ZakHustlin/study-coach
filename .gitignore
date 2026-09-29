@@ -11,3 +11,6 @@ token.json
 __pycache__/
 *.pyc
 .venv/
+
+# Local calendar state
+gcal_state.json

@@ -258,6 +258,33 @@ def unlogged_sessions(conn, day: str | None = None) -> list[dict]:
         """, (_today(day),)))
 
 
+# ---------------------------------------------------------------- calendar sync
+
+def sessions_to_create(conn, now: str | None = None) -> list[dict]:
+    """Planned sessions not yet in Google Calendar and not already over."""
+    return _rows(conn.execute(
+        """
+        SELECT s.*, i.title, t.name AS track
+        FROM sessions s
+        JOIN items i  ON i.item_id = s.item_id
+        JOIN tracks t ON t.track_id = i.track_id
+        WHERE s.status = 'planned' AND s.calendar_event_id IS NULL AND s.end_at > ?
+        ORDER BY s.start_at
+        """, (now or _now(),)))
+
+
+def sessions_to_remove(conn) -> list[dict]:
+    """Cancelled sessions whose calendar event still exists."""
+    return _rows(conn.execute(
+        "SELECT * FROM sessions WHERE status = 'cancelled' AND calendar_event_id IS NOT NULL"))
+
+
+def clear_calendar_event_id(conn, session_id: int) -> None:
+    with transaction(conn):
+        conn.execute("UPDATE sessions SET calendar_event_id = NULL WHERE session_id = ?",
+                     (session_id,))
+
+
 # ---------------------------------------------------------------- completions
 
 def log_completion(conn, item_id: int, outcome: str, minutes_spent: int = 0,
