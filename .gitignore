@@ -1,0 +1,13 @@
+# Personal data - never commit (this repo is public)
+*.db
+*.db-journal
+
+# Secrets for later steps: API keys, Google OAuth files, Telegram token
+.env
+credentials.json
+token.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
