@@ -679,14 +679,18 @@ if __name__ == "__main__":
     p.add_argument("command",
                    choices=["init", "seed", "snapshot", "version",
                             "proposals", "approve", "reject", "priorities",
-                            "load", "cancel-future", "guidance"],
+                            "load", "cancel-future", "guidance",
+                            "add-homework", "add-item", "items"],
                    help="init: empty db | seed: fake data | snapshot: planner view | "
                         "version: schema version | proposals: list pending | "
                         "approve/reject ID | priorities [TEXT]: show or set this week's | "
                         "load FILE: run a SQL file | cancel-future: cancel all future "
                         "sessions | guidance TRACK_ID TEXT: set a track's planner notes")
     p.add_argument("arg", nargs="?", help="proposal id, priorities text, file or track id")
-    p.add_argument("text", nargs="?", help="guidance text")
+    p.add_argument("text", nargs="?", help="guidance text / item title")
+    p.add_argument("extra", nargs="*", help="add-homework: MINUTES DUE_DATE | add-item: MINUTES")
+    p.add_argument("--strand", help="add-item: strand within the track")
+    p.add_argument("--due", help="add-item: due date YYYY-MM-DD")
     p.add_argument("--db", default=str(DEFAULT_DB))
     p.add_argument("--today", help="YYYY-MM-DD (default: real today)")
     args = p.parse_args()
@@ -712,6 +716,33 @@ if __name__ == "__main__":
     elif args.command == "cancel-future":
         print(f"Cancelled {cancel_future_sessions(conn)} session(s). "
               f"Now run `python gcal.py sync` to remove them from your calendar.")
+    elif args.command in ("add-homework", "add-item"):
+        # add-homework TITLE MINUTES DUE          -> Schoolwork track
+        # add-item TRACK TITLE MINUTES [--strand] [--due]
+        if args.command == "add-homework":
+            track_name, title, rest = "Schoolwork", args.arg, [args.text] + args.extra
+            if len(rest) != 2:
+                raise SystemExit('usage: add-homework "TITLE" MINUTES YYYY-MM-DD')
+            minutes, due = rest
+        else:
+            track_name, title = args.arg, args.text
+            if not title or len(args.extra) != 1:
+                raise SystemExit('usage: add-item "TRACK" "TITLE" MINUTES [--strand S] [--due DATE]')
+            minutes, due = args.extra[0], args.due
+        track = next((t for t in list_tracks(conn) if t["name"].lower() == track_name.lower()), None)
+        if track is None:
+            raise SystemExit(f"No active track {track_name!r}. Tracks: "
+                             + ", ".join(t["name"] for t in list_tracks(conn)))
+        if due:
+            date.fromisoformat(due)          # fail early on a typo like 2026-1-08
+        item_id = add_item(conn, track["track_id"], title, int(minutes),
+                           due_date=due, strand=args.strand)
+        print(f"Added item {item_id} to {track['name']}: {title} ({minutes} min"
+              + (f", due {due}" if due else "") + (f", strand {args.strand}" if args.strand else "") + ")")
+    elif args.command == "items":
+        for it in available_items(conn):
+            print(f"{it['item_id']:>4}  {it['track']:<22} {(it['strand'] or ''):<10} "
+                  f"{it['title']}" + (f"  (due {it['due_date']})" if it["due_date"] else ""))
     elif args.command == "guidance":
         set_track_guidance(conn, int(args.arg), args.text)
         print(f"Track {args.arg}: {args.text}")

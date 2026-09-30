@@ -33,6 +33,9 @@ python db.py version     # schema version (coach.db migrates itself on connect)
 python db.py proposals   # pending planner proposals
 python db.py approve 3   # approve proposal #3 (reject 3 to reject)
 python db.py priorities "TMUA paper 2, Greek hw"   # set this week's priorities
+python db.py items       # everything you can work on now, with ids
+python db.py add-homework "CS homework 3" 60 2026-10-15
+python db.py add-item "Greek" "Odyssey 16.1-25: translate + notes" 30 --strand odyssey
 python -m unittest -v    # run the tests
 
 pip install -r requirements.txt
