@@ -17,6 +17,7 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).parent
 DEFAULT_DB = ROOT / "coach.db"
@@ -127,12 +128,22 @@ def _rows(cur: sqlite3.Cursor) -> list[dict]:
     return [dict(r) for r in cur.fetchall()]
 
 
+# All times in the app are UK local time. Servers (Codespaces, the VPS) run on UTC,
+# so plain datetime.now() would be an hour behind during British Summer Time.
+LOCAL_TZ = ZoneInfo("Europe/London")
+
+
+def local_now() -> datetime:
+    """Current UK time as a naive datetime, matching how times are stored."""
+    return datetime.now(LOCAL_TZ).replace(tzinfo=None)
+
+
 def _today(today: str | None) -> str:
-    return today or date.today().isoformat()
+    return today or local_now().date().isoformat()
 
 
 def _now() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M")
+    return local_now().strftime("%Y-%m-%d %H:%M")
 
 
 # ---------------------------------------------------------------- named queries

@@ -32,7 +32,12 @@ class FakeClient:
     def create(self, **kwargs):
         self.requests.append({**kwargs, "messages": list(kwargs["messages"])})  # snapshot: the loop keeps appending
         content = self.replies.pop(0)
-        return NS(content=content, usage=NS(input_tokens=1000, output_tokens=100,
+        stop = "max_tokens" if content == "MAX" else (
+            "tool_use" if any(b.type == "tool_use" for b in content) else "end_turn")
+        if content == "MAX":
+            content = [NS(type="thinking", thinking="Let me consider every track...")]
+        return NS(content=content, stop_reason=stop,
+                  usage=NS(input_tokens=1000, output_tokens=100,
                                             cache_creation_input_tokens=0,
                                             cache_read_input_tokens=0))
 
@@ -85,6 +90,13 @@ class PlannerLoopTest(unittest.TestCase):
         result = planner.run(self.ctx, client)
         self.assertFalse(result.finished)
         self.assertEqual(len(client.requests), 2)
+
+    def test_max_tokens_stops_and_says_why(self):
+        client = FakeClient(["MAX"])
+        result = planner.run(self.ctx, client)
+        self.assertFalse(result.finished)
+        self.assertIn("max_tokens", result.summary)
+        self.assertEqual(result.trace[0]["blocks"], ["thinking"])
 
     def test_step_limit(self):
         loop = [[call("get_sessions", i, date_from="2026-09-29", date_to="2026-10-04")]

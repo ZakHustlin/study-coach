@@ -155,7 +155,7 @@ if __name__ == "__main__":
         print(sync(db.connect(), service(), calendar_id(), tz))
     else:
         conn = db.connect()
-        start = date.today()
+        start = db.local_now().date()
         end = (start + timedelta(days=args.days)).isoformat()
         planned = db.sessions_between(conn, start.isoformat(), end)
         for slot in availability.free_slots_range(start, args.days, config, planned):

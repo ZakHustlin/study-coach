@@ -25,7 +25,6 @@ import json
 import os
 import sqlite3
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import availability
@@ -34,7 +33,9 @@ import tools
 
 ROOT = Path(__file__).parent
 MAX_STEPS = 25            # model replies per run; stops a confused model looping forever
-MAX_TOKENS = 2000         # per reply
+MAX_TOKENS = 8000         # per reply. Reasoning models "think" before answering and
+                          # that counts as output, so this needs headroom. You only pay
+                          # for tokens actually used, not for the limit.
 
 # Which LLM to use. DeepSeek offers an Anthropic-compatible endpoint, so the same
 # `anthropic` library and the same loop work for both: only the address, key and
@@ -121,6 +122,7 @@ class RunResult:
     steps: int
     usage: dict = field(default_factory=dict)
     finished: bool = False
+    trace: list[dict] = field(default_factory=list)   # per step: why it stopped, what it sent
     prices: dict = field(default_factory=lambda: PROVIDERS[DEFAULT_PROVIDER]["prices"])
 
     @property
@@ -151,6 +153,7 @@ def run(ctx: tools.Context, client, model: str = PROVIDERS[DEFAULT_PROVIDER]["mo
     messages = [{"role": "user", "content":
                  "Current state:\n" + json.dumps(initial_state(ctx), indent=1)}]
     usage: dict = {}
+    trace: list[dict] = []
     nudged = False
 
     for step in range(1, MAX_STEPS + 1):
@@ -160,17 +163,30 @@ def run(ctx: tools.Context, client, model: str = PROVIDERS[DEFAULT_PROVIDER]["mo
         messages.append({"role": "assistant", "content": response.content})
 
         calls = [b for b in response.content if b.type == "tool_use"]
+        stop = getattr(response, "stop_reason", None)
+        trace.append({"step": step, "stop_reason": stop,
+                      "blocks": [b.type for b in response.content],
+                      "output_tokens": response.usage.output_tokens,
+                      "text": " ".join(getattr(b, "text", "") or getattr(b, "thinking", "") or ""
+                                       for b in response.content)[:500]})
         if verbose:
+            print(f"  [{step}] stop={stop} blocks={[b.type for b in response.content]} "
+                  f"out={response.usage.output_tokens}")
             for b in response.content:
-                if b.type == "text" and b.text.strip():
-                    print(f"  [{step}] thinks: {b.text.strip()[:200]}")
+                words = getattr(b, "text", None) or getattr(b, "thinking", None)
+                if words and words.strip():
+                    print(f"  [{step}] {b.type}: {words.strip()[:200]}")
 
         if not calls:
+            if stop == "max_tokens":
+                # Ran out of room mid-reply (usually while reasoning). Retrying won't help.
+                break
             # The model stopped without calling finish. Remind it once, then give up.
             if nudged:
                 break
             nudged = True
-            messages.append({"role": "user", "content": "Call finish with your summary."})
+            messages.append({"role": "user", "content":
+                             "Use the tools to make the plan, then call finish with your summary."})
             continue
 
         results = []
@@ -186,13 +202,15 @@ def run(ctx: tools.Context, client, model: str = PROVIDERS[DEFAULT_PROVIDER]["mo
                             "content": json.dumps(result), "is_error": "error" in result})
         if finish is not None:
             summary = str(finish.input.get("summary", "")).strip()
-            return RunResult(summary, ctx.log, step, usage, finished=True, prices=prices)
+            return RunResult(summary, ctx.log, step, usage, finished=True, prices=prices, trace=trace)
         # Every tool_use must be answered by a tool_result in the very next message.
         messages.append({"role": "user", "content": results})
 
-    return RunResult("Stopped before finishing (step limit or no finish call). "
-                     "Check the changes list.", ctx.log, step, usage, finished=False,
-                     prices=prices)
+    reason = ("the reply hit the max_tokens limit" if trace and trace[-1]["stop_reason"] == "max_tokens"
+              else "step limit reached" if step == MAX_STEPS
+              else "the model replied without calling any tool")
+    return RunResult(f"Stopped before finishing: {reason}. See the trace in the log.",
+                     ctx.log, step, usage, finished=False, prices=prices, trace=trace)
 
 
 # ---------------------------------------------------------------- setup + CLI
@@ -226,7 +244,7 @@ def save_log(result: RunResult, now: str, dry_run: bool) -> Path:
     path.write_text(json.dumps({
         "now": now, "dry_run": dry_run, "finished": result.finished, "steps": result.steps,
         "summary": result.summary, "changes": result.changes, "usage": result.usage,
-        "cost_usd": round(result.cost_usd, 4)}, indent=2))
+        "cost_usd": round(result.cost_usd, 4), "trace": result.trace}, indent=2))
     return path
 
 
@@ -251,7 +269,7 @@ def main() -> None:
     client = anthropic.Anthropic(api_key=key, base_url=provider["base_url"])
     model = args.model or os.environ.get("PLANNER_MODEL", provider["model"])
 
-    now = args.now or datetime.now().strftime(tools.FMT)
+    now = args.now or db.local_now().strftime(tools.FMT)
     conn = copy_db(Path(args.db)) if args.dry_run else db.connect(args.db)
     if not args.dry_run:
         # Unanswered proposals from earlier days were about a plan that has moved on.
