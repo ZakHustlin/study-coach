@@ -90,7 +90,11 @@ so write it as that request: what to open (text, pages, lines, spec point), the 
 task, and what "done" looks like, in 1-3 sentences. E.g. "Quiz me on the fetch-\
 decode-execute cycle and the role of each register (OCR 1.1.1), then set 5 exam-\
 style questions and mark my answers." For open-ended items, pick the next \
-concrete chunk (e.g. "Read pages 60-90 of the Odyssey") based on the item history.
+concrete chunk (e.g. "Read pages 60-90 of the Odyssey") based on the item history. \
+Only the NEXT session of an open-ended item gets exact pages or lines; later ones say \
+"continue from where you stopped", because a skipped session would make them wrong.
+- Book every homework item that fits in this window, even if it's due next week: \
+homework left for later competes with next week's homework.
 
 Rules
 - Tools enforce the hard rules (free time, daily cap, gaps, due dates, locked \
