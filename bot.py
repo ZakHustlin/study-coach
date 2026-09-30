@@ -72,8 +72,16 @@ def owner_only(handler):
     """Ignore every chat except the owner's."""
     @wraps(handler)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.effective_chat is None or update.effective_chat.id != owner_id():
+        chat = update.effective_chat.id if update.effective_chat else None
+        if owner_id() is None and update.message:
+            # Not linked yet: say so, instead of silently ignoring
+            log.info("Command from chat %s before /start", chat)
+            await update.message.reply_text("I'm not linked to anyone yet. Send /start first.")
             return
+        if chat != owner_id():
+            log.info("Ignored chat %s (owner is %s)", chat, owner_id())
+            return
+        log.info("Handling %s", handler.__name__)
         return await handler(update, context)
     return wrapper
 
