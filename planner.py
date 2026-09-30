@@ -33,7 +33,7 @@ import tools
 
 ROOT = Path(__file__).parent
 MAX_STEPS = 25            # model replies per run; stops a confused model looping forever
-MAX_TOKENS = 8000         # per reply. Reasoning models "think" before answering and
+MAX_TOKENS = 16000        # per reply. Reasoning models "think" before answering and
                           # that counts as output, so this needs headroom. You only pay
                           # for tokens actually used, not for the limit.
 
@@ -80,9 +80,11 @@ Vary tracks within an evening rather than stacking one subject.
 - Low confidence (1-2) on a finished topic, or a note like "didn't get it", is a \
 reason to add a short revision item.
 - Leave slack. Don't fill every free minute; Zak is at school all day.
-- Work out the whole layout first, day by day, then book it in time order. Anything \
-that follows on from other work (marking a paper, reviewing a topic) goes after that \
-work, never before. Don't book something and then move it in the same run.
+- Plan ONE DAY AT A TIME, in date order: decide that day's sessions, book them with \
+tool calls, then move on to the next day. Don't work out the whole week in your \
+head first. Keep your reasoning short; the tools check the rules for you.
+- Anything that follows on from other work (marking a paper, reviewing a topic) goes \
+after that work, never before. Don't book something and then move it in the same run.
 - Every session needs a brief. Zak pastes it into an AI tutor to run the session, \
 so write it as that request: what to open (text, pages, lines, spec point), the \
 task, and what "done" looks like, in 1-3 sentences. E.g. "Quiz me on the fetch-\
@@ -154,6 +156,16 @@ def _add_usage(total: dict, usage) -> None:
     total["cache_read"] = total.get("cache_read", 0) + (getattr(usage, "cache_read_input_tokens", 0) or 0)
 
 
+def _append_user_text(messages: list, text: str) -> None:
+    """Add text to the last (user) message. Messages must alternate user/assistant,
+    so after dropping an assistant reply we extend the user turn instead."""
+    last = messages[-1]
+    if isinstance(last["content"], str):
+        last["content"] += "\n\n" + text
+    else:
+        last["content"] = list(last["content"]) + [{"type": "text", "text": text}]
+
+
 def run(ctx: tools.Context, client, model: str = PROVIDERS[DEFAULT_PROVIDER]["model"],
         verbose: bool = False, prices: dict | None = None) -> RunResult:
     prices = prices or PROVIDERS[DEFAULT_PROVIDER]["prices"]
@@ -169,13 +181,12 @@ def run(ctx: tools.Context, client, model: str = PROVIDERS[DEFAULT_PROVIDER]["mo
     usage: dict = {}
     trace: list[dict] = []
     nudged = False
+    overflows = 0
 
     for step in range(1, MAX_STEPS + 1):
         response = client.messages.create(model=model, max_tokens=MAX_TOKENS, system=system,
                                           tools=tool_defs, messages=messages)
         _add_usage(usage, response.usage)
-        messages.append({"role": "assistant", "content": response.content})
-
         calls = [b for b in response.content if b.type == "tool_use"]
         stop = getattr(response, "stop_reason", None)
         trace.append({"step": step, "stop_reason": stop,
@@ -191,10 +202,19 @@ def run(ctx: tools.Context, client, model: str = PROVIDERS[DEFAULT_PROVIDER]["mo
                 if words and words.strip():
                     print(f"  [{step}] {b.type}: {words.strip()[:200]}")
 
-        if not calls:
-            if stop == "max_tokens":
-                # Ran out of room mid-reply (usually while reasoning). Retrying won't help.
+        if not calls and stop == "max_tokens":
+            # Ran out of room before calling any tool (usually over-long reasoning).
+            # Drop the cut-off reply and ask again, more narrowly, up to twice.
+            overflows += 1
+            if overflows > 2:
                 break
+            _append_user_text(messages, "Your last reply ran out of space before any tool "
+                              "call. Don't plan the whole week at once: book the next "
+                              "day's sessions now with tool calls, then continue.")
+            continue
+
+        messages.append({"role": "assistant", "content": response.content})
+        if not calls:
             # The model stopped without calling finish. Remind it once, then give up.
             if nudged:
                 break

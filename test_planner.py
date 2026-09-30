@@ -91,8 +91,16 @@ class PlannerLoopTest(unittest.TestCase):
         self.assertFalse(result.finished)
         self.assertEqual(len(client.requests), 2)
 
-    def test_max_tokens_stops_and_says_why(self):
-        client = FakeClient(["MAX"])
+    def test_max_tokens_retries_then_recovers(self):
+        client = FakeClient(["MAX", [call("finish", 1, summary="ok")]])
+        result = planner.run(self.ctx, client)
+        self.assertTrue(result.finished)
+        retry = client.requests[1]["messages"]
+        self.assertEqual([m["role"] for m in retry], ["user"])     # cut-off reply dropped
+        self.assertIn("ran out of space", retry[0]["content"])
+
+    def test_max_tokens_gives_up_after_two_retries(self):
+        client = FakeClient(["MAX", "MAX", "MAX"])
         result = planner.run(self.ctx, client)
         self.assertFalse(result.finished)
         self.assertIn("max_tokens", result.summary)
