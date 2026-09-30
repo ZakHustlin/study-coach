@@ -5,6 +5,7 @@
 PRAGMA foreign_keys = ON;
 
 -- Drop children before parents
+DROP TABLE IF EXISTS passages;
 DROP TABLE IF EXISTS proposals;
 DROP TABLE IF EXISTS weekly_priorities;
 DROP TABLE IF EXISTS completions;
@@ -99,6 +100,19 @@ CREATE TABLE weekly_priorities (
     set_at     TEXT NOT NULL
 );
 
+-- Set-text syllabus: how far class has got. Not work items: the planner never books
+-- these, it only reads which are covered so revision tests stay within them.
+CREATE TABLE passages (
+    passage_id INTEGER PRIMARY KEY,
+    track_id   INTEGER NOT NULL,
+    strand     TEXT    NOT NULL,                   -- 'odyssey', 'herodotus'
+    ref        TEXT    NOT NULL,                   -- e.g. 'Od. 16.201-225'
+    position   INTEGER NOT NULL,                   -- order within the strand
+    covered_on TEXT,                               -- date translated in class; NULL = not yet
+    UNIQUE (strand, ref),
+    FOREIGN KEY (track_id) REFERENCES tracks(track_id)
+);
+
 CREATE INDEX idx_items_track        ON items(track_id);
 CREATE INDEX idx_sessions_start     ON sessions(start_at);
 CREATE INDEX idx_completions_item   ON completions(item_id, logged_at);
@@ -118,4 +132,4 @@ BEGIN
 END;
 
 -- Schema version: must equal len(db.MIGRATIONS). Bump both together.
-PRAGMA user_version = 2;
+PRAGMA user_version = 3;

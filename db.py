@@ -84,6 +84,19 @@ MIGRATIONS: list[str] = [
     ALTER TABLE tracks ADD COLUMN guidance TEXT;
     ALTER TABLE items ADD COLUMN strand TEXT;
     """,
+    # 3: set-text passages and how far class has covered them
+    """
+    CREATE TABLE passages (
+        passage_id INTEGER PRIMARY KEY,
+        track_id   INTEGER NOT NULL,
+        strand     TEXT    NOT NULL,                   -- 'odyssey', 'herodotus'
+        ref        TEXT    NOT NULL,                   -- e.g. 'Od. 16.201-225'
+        position   INTEGER NOT NULL,                   -- order within the strand
+        covered_on TEXT,                               -- date translated in class; NULL = not yet
+        UNIQUE (strand, ref),
+        FOREIGN KEY (track_id) REFERENCES tracks(track_id)
+    );
+    """,
 ]
 
 
@@ -635,6 +648,43 @@ def strand_balance(conn, today: str | None = None) -> list[dict]:
         """, {"today": _today(today)}))
 
 
+def list_passages(conn, strand: str | None = None) -> list[dict]:
+    sql = "SELECT * FROM passages"
+    params: tuple = ()
+    if strand:
+        sql += " WHERE strand = ?"
+        params = (strand,)
+    return _rows(conn.execute(sql + " ORDER BY strand, position", params))
+
+
+def mark_covered(conn, passage_id: int, day: str | None = None) -> int:
+    """Mark a passage covered in class, plus every earlier passage in its strand
+    (class goes through in order). Returns how many were newly marked."""
+    with transaction(conn):
+        p = conn.execute("SELECT strand, position FROM passages WHERE passage_id = ?",
+                         (passage_id,)).fetchone()
+        if p is None:
+            raise ValueError(f"no passage {passage_id}")
+        cur = conn.execute(
+            "UPDATE passages SET covered_on = ? "
+            "WHERE strand = ? AND position <= ? AND covered_on IS NULL",
+            (_today(day), p["strand"], p["position"]))
+    return cur.rowcount
+
+
+def coverage(conn) -> list[dict]:
+    """Per set text: which passages class has covered, for the planner's briefs."""
+    out = []
+    for strand in [r[0] for r in conn.execute(
+            "SELECT DISTINCT strand FROM passages ORDER BY strand")]:
+        rows = list_passages(conn, strand)
+        covered = [r["ref"] for r in rows if r["covered_on"]]
+        out.append({"strand": strand, "covered": covered,
+                    "covered_count": len(covered), "total": len(rows),
+                    "next_in_class": next((r["ref"] for r in rows if not r["covered_on"]), None)})
+    return out
+
+
 def cancel_future_sessions(conn, now: str | None = None) -> int:
     """Cancel every planned, unlocked session that hasn't started. Used before wiping
     the database so `gcal.py sync` removes their calendar events first."""
@@ -680,7 +730,8 @@ if __name__ == "__main__":
                    choices=["init", "seed", "snapshot", "version",
                             "proposals", "approve", "reject", "priorities",
                             "load", "cancel-future", "guidance",
-                            "add-homework", "add-item", "items"],
+                            "add-homework", "add-item", "items",
+                            "passages", "covered"],
                    help="init: empty db | seed: fake data | snapshot: planner view | "
                         "version: schema version | proposals: list pending | "
                         "approve/reject ID | priorities [TEXT]: show or set this week's | "
@@ -744,6 +795,16 @@ if __name__ == "__main__":
                            due_date=due, strand=args.strand)
         print(f"Added item {item_id} to {track['name']}: {title} ({minutes} min"
               + (f", due {due}" if due else "") + (f", strand {args.strand}" if args.strand else "") + ")")
+    elif args.command == "passages":
+        for r in list_passages(conn, args.arg):
+            print(f"{r['passage_id']:>4}  {r['strand']:<10} {r['ref']:<20} "
+                  + (f"covered {r['covered_on']}" if r["covered_on"] else "-"))
+    elif args.command == "covered":
+        n = mark_covered(conn, int(args.arg), args.today)
+        print(f"Marked {n} passage(s) covered. Coverage now:")
+        for c in coverage(conn):
+            print(f"  {c['strand']}: {c['covered_count']}/{c['total']}"
+                  + (f", next in class {c['next_in_class']}" if c["next_in_class"] else ""))
     elif args.command == "items":
         for it in available_items(conn):
             print(f"{it['item_id']:>4}  {it['track']:<22} {(it['strand'] or ''):<10} "

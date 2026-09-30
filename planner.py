@@ -71,6 +71,10 @@ overrides the general rules below (e.g. "every day, 30 min" means spread, not ba
 their weekly target, weighted by track priority (5 = most important).
 - Tracks with strands: rotate between them using `strand_balance_14d`, favouring the \
 strand with the fewest recent minutes or the oldest last_touched.
+- `set_text_coverage` lists which set-text passages Zak has covered in class. Tests \
+and revision on a set text use ONLY covered passages: name the covered refs in the \
+brief so the tutor knows what's fair game. If a text has nothing covered yet, give \
+that slot to another strand. Never book first-time translation of an uncovered passage.
 - Some items are open-ended (a very large estimate, e.g. a whole book or ongoing \
 vocab work). Keep scheduling chunks of them; never propose marking them done.
 - Keep what's already planned unless there's a reason to change it. Don't churn the \
@@ -122,6 +126,7 @@ def initial_state(ctx: tools.Context) -> dict:
         "weekly_priorities": snap["weekly_priorities"] or "(Zak hasn't set any this week)",
         "tracks_this_week": db.week_progress(ctx.conn, today, ctx.now),
         "strand_balance_14d": db.strand_balance(ctx.conn, today),
+        "set_text_coverage": db.coverage(ctx.conn),
         "planned_sessions": tools.get_sessions(ctx, today, until)["sessions"],
         "free_time": tools.get_free_slots(ctx, today, until)["days"],
         "available_items": db.available_items(ctx.conn, ctx.now),

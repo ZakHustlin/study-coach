@@ -20,3 +20,4 @@ logs/
 
 # Real tracks and items (personal) - load with: python db.py load my_data.sql
 my_data.sql
+greek_update.sql

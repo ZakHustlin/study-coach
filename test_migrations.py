@@ -103,6 +103,17 @@ class PlannerTablesTest(unittest.TestCase):
         self.assertEqual(db.pending_proposals(self.conn)[0]["proposal_id"], pid)  # still pending
         self.assertEqual(db.get_session(self.conn, sid)["status"], "planned")
 
+    def test_passages_and_coverage(self):
+        self.conn.executemany(
+            "INSERT INTO passages (track_id, strand, ref, position) VALUES (1, 'odyssey', ?, ?)",
+            [("Od. 16.201-225", 1), ("Od. 16.226-250", 2), ("Od. 16.251-275", 3)])
+        pid = self.conn.execute("SELECT passage_id FROM passages WHERE position = 2").fetchone()[0]
+        self.assertEqual(db.mark_covered(self.conn, pid, "2026-09-30"), 2)   # 1 and 2
+        cov = db.coverage(self.conn)[0]
+        self.assertEqual(cov["covered"], ["Od. 16.201-225", "Od. 16.226-250"])
+        self.assertEqual(cov["next_in_class"], "Od. 16.251-275")
+        self.assertEqual(db.mark_covered(self.conn, pid), 0)   # already covered
+
     def test_weekly_priorities(self):
         self.assertEqual(db.week_start("2026-10-04"), "2026-09-28")   # Sunday -> its Monday
         db.set_weekly_priorities(self.conn, "TMUA paper 1; Greek homework", "2026-09-30")
