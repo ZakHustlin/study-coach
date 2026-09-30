@@ -13,6 +13,7 @@ this file decides whether to run them, and tools.py enforces the rules.
 
 Usage:
   python planner.py --dry-run      # plan against a COPY of coach.db, change nothing
+  (needs DEEPSEEK_API_KEY=... in .env, or PLANNER_PROVIDER=anthropic + ANTHROPIC_API_KEY)
   python planner.py                # plan for real, then run `python gcal.py sync`
   python planner.py --dry-run --now "2026-10-01 21:45"   # pretend it's another time
 """
@@ -32,12 +33,29 @@ import db
 import tools
 
 ROOT = Path(__file__).parent
-DEFAULT_MODEL = "claude-haiku-4-5-20251001"
 MAX_STEPS = 25            # model replies per run; stops a confused model looping forever
 MAX_TOKENS = 2000         # per reply
 
-# US$ per million tokens, for the cost estimate. Update if prices change.
-PRICES = {"input": 1.00, "output": 5.00, "cache_write": 1.25, "cache_read": 0.10}
+# Which LLM to use. DeepSeek offers an Anthropic-compatible endpoint, so the same
+# `anthropic` library and the same loop work for both: only the address, key and
+# model name change. Choose with PLANNER_PROVIDER in .env (default: deepseek).
+# prices: US$ per million tokens, for the cost estimate only. Update if they change.
+PROVIDERS = {
+    "deepseek": {
+        "base_url": "https://api.deepseek.com/anthropic",
+        "key_env": "DEEPSEEK_API_KEY",
+        "model": "deepseek-flash",
+        # off-peak rates; 21:45 UK time is off-peak
+        "prices": {"input": 0.15, "output": 0.60, "cache_write": 0.15, "cache_read": 0.003},
+    },
+    "anthropic": {
+        "base_url": None,
+        "key_env": "ANTHROPIC_API_KEY",
+        "model": "claude-haiku-4-5-20251001",
+        "prices": {"input": 1.00, "output": 5.00, "cache_write": 1.25, "cache_read": 0.10},
+    },
+}
+DEFAULT_PROVIDER = "deepseek"
 
 SYSTEM_PROMPT = """\
 You are Zak's study planner. Zak is a UK sixth-form student. Each evening you re-plan \
@@ -103,13 +121,14 @@ class RunResult:
     steps: int
     usage: dict = field(default_factory=dict)
     finished: bool = False
+    prices: dict = field(default_factory=lambda: PROVIDERS[DEFAULT_PROVIDER]["prices"])
 
     @property
     def cost_usd(self) -> float:
-        u = self.usage
-        return (u.get("input", 0) * PRICES["input"] + u.get("output", 0) * PRICES["output"]
-                + u.get("cache_write", 0) * PRICES["cache_write"]
-                + u.get("cache_read", 0) * PRICES["cache_read"]) / 1_000_000
+        u, p = self.usage, self.prices
+        return (u.get("input", 0) * p["input"] + u.get("output", 0) * p["output"]
+                + u.get("cache_write", 0) * p["cache_write"]
+                + u.get("cache_read", 0) * p["cache_read"]) / 1_000_000
 
 
 def _add_usage(total: dict, usage) -> None:
@@ -119,7 +138,9 @@ def _add_usage(total: dict, usage) -> None:
     total["cache_read"] = total.get("cache_read", 0) + (getattr(usage, "cache_read_input_tokens", 0) or 0)
 
 
-def run(ctx: tools.Context, client, model: str = DEFAULT_MODEL, verbose: bool = False) -> RunResult:
+def run(ctx: tools.Context, client, model: str = PROVIDERS[DEFAULT_PROVIDER]["model"],
+        verbose: bool = False, prices: dict | None = None) -> RunResult:
+    prices = prices or PROVIDERS[DEFAULT_PROVIDER]["prices"]
     # Prompt caching: the system prompt and tool list are identical on every step,
     # so we mark them cacheable. From step 2 onwards they're read from cache at a
     # tenth of the normal input price instead of being paid for in full again.
@@ -165,12 +186,13 @@ def run(ctx: tools.Context, client, model: str = DEFAULT_MODEL, verbose: bool = 
                             "content": json.dumps(result), "is_error": "error" in result})
         if finish is not None:
             summary = str(finish.input.get("summary", "")).strip()
-            return RunResult(summary, ctx.log, step, usage, finished=True)
+            return RunResult(summary, ctx.log, step, usage, finished=True, prices=prices)
         # Every tool_use must be answered by a tool_result in the very next message.
         messages.append({"role": "user", "content": results})
 
     return RunResult("Stopped before finishing (step limit or no finish call). "
-                     "Check the changes list.", ctx.log, step, usage, finished=False)
+                     "Check the changes list.", ctx.log, step, usage, finished=False,
+                     prices=prices)
 
 
 # ---------------------------------------------------------------- setup + CLI
@@ -213,15 +235,21 @@ def main() -> None:
     p.add_argument("--dry-run", action="store_true", help="plan on a copy; change nothing")
     p.add_argument("--now", help="'YYYY-MM-DD HH:MM' (default: real now)")
     p.add_argument("--db", default=str(db.DEFAULT_DB))
-    p.add_argument("--model", default=None, help=f"default {DEFAULT_MODEL}")
+    p.add_argument("--model", default=None, help="override the provider's default model")
     p.add_argument("-q", "--quiet", action="store_true")
     args = p.parse_args()
 
     load_env()
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        raise SystemExit("No ANTHROPIC_API_KEY. Add it to .env (see README).")
+    name = os.environ.get("PLANNER_PROVIDER", DEFAULT_PROVIDER)
+    if name not in PROVIDERS:
+        raise SystemExit(f"PLANNER_PROVIDER must be one of {', '.join(PROVIDERS)}")
+    provider = PROVIDERS[name]
+    key = os.environ.get(provider["key_env"])
+    if not key:
+        raise SystemExit(f"No {provider['key_env']}. Add it to .env (see README).")
     import anthropic                       # imported here so tests don't need it
-    client = anthropic.Anthropic()
+    client = anthropic.Anthropic(api_key=key, base_url=provider["base_url"])
+    model = args.model or os.environ.get("PLANNER_MODEL", provider["model"])
 
     now = args.now or datetime.now().strftime(tools.FMT)
     conn = copy_db(Path(args.db)) if args.dry_run else db.connect(args.db)
@@ -230,9 +258,16 @@ def main() -> None:
         db.expire_proposals(conn, created_before=now[:10])
 
     ctx = tools.Context(conn, availability.load_config(), now)
-    print(f"Planning {ctx.today} -> {ctx.horizon_end}{' (DRY RUN)' if args.dry_run else ''}")
-    result = run(ctx, client, args.model or os.environ.get("PLANNER_MODEL", DEFAULT_MODEL),
-                 verbose=not args.quiet)
+    print(f"Planning {ctx.today} -> {ctx.horizon_end} with {model}"
+          f"{' (DRY RUN)' if args.dry_run else ''}")
+    try:
+        result = run(ctx, client, model, verbose=not args.quiet, prices=provider["prices"])
+    except anthropic.AuthenticationError:
+        raise SystemExit(f"{name} rejected the API key. Check {provider['key_env']} in .env.")
+    except anthropic.APIConnectionError:
+        raise SystemExit(f"Couldn't reach {name}. Check your internet connection.")
+    except anthropic.APIStatusError as e:
+        raise SystemExit(f"{name} returned an error ({e.status_code}): {e.message}")
 
     print("\n" + result.summary)
     print(f"\n{len(result.changes)} change(s), {result.steps} step(s), "

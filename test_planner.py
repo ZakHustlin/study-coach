@@ -94,8 +94,13 @@ class PlannerLoopTest(unittest.TestCase):
         self.assertEqual(result.steps, planner.MAX_STEPS)
 
     def test_cost_estimate(self):
-        r = planner.RunResult("", [], 1, {"input": 1_000_000, "output": 100_000})
+        haiku = planner.PROVIDERS["anthropic"]["prices"]
+        r = planner.RunResult("", [], 1, {"input": 1_000_000, "output": 100_000}, prices=haiku)
         self.assertAlmostEqual(r.cost_usd, 1.5)
+
+    def test_providers_complete(self):
+        for name, p in planner.PROVIDERS.items():
+            self.assertEqual(set(p), {"base_url", "key_env", "model", "prices"}, name)
 
     def test_dry_run_copy_is_separate(self):
         import tempfile, pathlib

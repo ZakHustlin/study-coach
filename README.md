@@ -41,7 +41,7 @@ python gcal.py setup     # one-off: create the Study (agent) calendar
 python gcal.py sync      # push planned/cancelled sessions to Google Calendar
 python gcal.py free      # free slots for the next 7 days
 
-# Planner: needs ANTHROPIC_API_KEY=... in .env
+# Planner: needs DEEPSEEK_API_KEY=... in .env (or PLANNER_PROVIDER=anthropic + ANTHROPIC_API_KEY)
 python planner.py --dry-run   # plan on a copy of coach.db, change nothing
 python planner.py             # plan for real, then: python gcal.py sync
 ```
