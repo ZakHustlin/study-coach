@@ -92,6 +92,12 @@ class DataLayerTest(unittest.TestCase):
         ids = [r["session_id"] for r in db.unlogged_sessions(self.conn, TODAY)]
         self.assertEqual(ids, [s])
 
+    def test_week_progress_splits_logged_and_ahead(self):
+        rows = {r["track"]: r for r in db.week_progress(self.conn, "2026-09-30", "2026-09-30 14:00")}
+        self.assertEqual(rows["TMUA maths"]["minutes_planned_ahead"], 150)   # tonight's paper
+        self.assertEqual(rows["Ancient Greek"]["minutes_planned_ahead"], 0)  # Tuesday's is past
+        self.assertEqual(rows["Ancient Greek"]["minutes_logged"], 50)
+
     def test_planner_snapshot_has_everything(self):
         snap = db.planner_snapshot(self.conn, TODAY)
         self.assertEqual(set(snap), {"today", "tracks", "next_items", "completion_rates_14d",

@@ -74,6 +74,9 @@ Vary tracks within an evening rather than stacking one subject.
 - Low confidence (1-2) on a finished topic, or a note like "didn't get it", is a \
 reason to add a short revision item.
 - Leave slack. Don't fill every free minute; Zak is at school all day.
+- Work out the whole layout first, day by day, then book it in time order. Anything \
+that follows on from other work (marking a paper, reviewing a topic) goes after that \
+work, never before. Don't book something and then move it in the same run.
 - Every session needs a brief: 1-3 concrete sentences saying what to do, e.g. \
 "Do questions 1-10 of the paper under timed conditions, then mark them."
 
@@ -101,7 +104,7 @@ def initial_state(ctx: tools.Context) -> dict:
         "weekday": ctx.today.strftime("%A"),
         "plan_until": until,
         "weekly_priorities": snap["weekly_priorities"] or "(Zak hasn't set any this week)",
-        "tracks_this_week": db.week_progress(ctx.conn, today),
+        "tracks_this_week": db.week_progress(ctx.conn, today, ctx.now),
         "planned_sessions": tools.get_sessions(ctx, today, until)["sessions"],
         "free_time": tools.get_free_slots(ctx, today, until)["days"],
         "available_items": db.available_items(ctx.conn, ctx.now),
