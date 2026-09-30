@@ -171,8 +171,11 @@ def _append_user_text(messages: list, text: str) -> None:
 
 
 def run(ctx: tools.Context, client, model: str = PROVIDERS[DEFAULT_PROVIDER]["model"],
-        verbose: bool = False, prices: dict | None = None) -> RunResult:
+        verbose: bool = False, prices: dict | None = None,
+        extra: dict | None = None) -> RunResult:
+    """extra: additional request fields, e.g. {"thinking": {"type": "disabled"}}."""
     prices = prices or PROVIDERS[DEFAULT_PROVIDER]["prices"]
+    extra = extra or {}
     # Prompt caching: the system prompt and tool list are identical on every step,
     # so we mark them cacheable. From step 2 onwards they're read from cache at a
     # tenth of the normal input price instead of being paid for in full again.
@@ -189,7 +192,7 @@ def run(ctx: tools.Context, client, model: str = PROVIDERS[DEFAULT_PROVIDER]["mo
 
     for step in range(1, MAX_STEPS + 1):
         response = client.messages.create(model=model, max_tokens=MAX_TOKENS, system=system,
-                                          tools=tool_defs, messages=messages)
+                                          tools=tool_defs, messages=messages, **extra)
         _add_usage(usage, response.usage)
         calls = [b for b in response.content if b.type == "tool_use"]
         stop = getattr(response, "stop_reason", None)
@@ -293,6 +296,7 @@ def main() -> None:
     p.add_argument("--db", default=str(db.DEFAULT_DB))
     p.add_argument("--model", default=None, help="override the provider's default model")
     p.add_argument("-q", "--quiet", action="store_true")
+    p.add_argument("--thinking", choices=["on", "off"], help="default: PLANNER_THINKING or on")
     args = p.parse_args()
 
     load_env()
@@ -306,6 +310,10 @@ def main() -> None:
     import anthropic                       # imported here so tests don't need it
     client = anthropic.Anthropic(api_key=key, base_url=provider["base_url"])
     model = args.model or os.environ.get("PLANNER_MODEL", provider["model"])
+    # PLANNER_THINKING=off asks the model to answer without a hidden reasoning phase.
+    # Cheaper and can't overflow, but may plan less carefully: compare with --dry-run.
+    thinking = (args.thinking or os.environ.get("PLANNER_THINKING", "on")).lower()
+    extra = {"thinking": {"type": "disabled"}} if thinking == "off" else {}
 
     now = args.now or db.local_now().strftime(tools.FMT)
     conn = copy_db(Path(args.db)) if args.dry_run else db.connect(args.db)
@@ -314,10 +322,11 @@ def main() -> None:
         db.expire_proposals(conn, created_before=now[:10])
 
     ctx = tools.Context(conn, availability.load_config(), now)
-    print(f"Planning {ctx.today} -> {ctx.horizon_end} with {model}"
+    print(f"Planning {ctx.today} -> {ctx.horizon_end} with {model}, thinking {thinking}"
           f"{' (DRY RUN)' if args.dry_run else ''}")
     try:
-        result = run(ctx, client, model, verbose=not args.quiet, prices=provider["prices"])
+        result = run(ctx, client, model, verbose=not args.quiet, prices=provider["prices"],
+                     extra=extra)
     except anthropic.AuthenticationError:
         raise SystemExit(f"{name} rejected the API key. Check {provider['key_env']} in .env.")
     except anthropic.APIConnectionError:

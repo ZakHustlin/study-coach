@@ -733,9 +733,14 @@ if __name__ == "__main__":
         if track is None:
             raise SystemExit(f"No active track {track_name!r}. Tracks: "
                              + ", ".join(t["name"] for t in list_tracks(conn)))
-        if due:
-            date.fromisoformat(due)          # fail early on a typo like 2026-1-08
-        item_id = add_item(conn, track["track_id"], title, int(minutes),
+        try:
+            if due:
+                date.fromisoformat(due)      # fail early on a typo like 2026-1-08
+            minutes = int(minutes)
+        except ValueError:
+            raise SystemExit(f"Minutes must be a number and the date YYYY-MM-DD "
+                             f"(got {minutes!r}, {due!r})")
+        item_id = add_item(conn, track["track_id"], title, minutes,
                            due_date=due, strand=args.strand)
         print(f"Added item {item_id} to {track['name']}: {title} ({minutes} min"
               + (f", due {due}" if due else "") + (f", strand {args.strand}" if args.strand else "") + ")")

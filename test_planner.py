@@ -106,6 +106,11 @@ class PlannerLoopTest(unittest.TestCase):
         self.assertIn("max_tokens", result.summary)
         self.assertEqual(result.trace[0]["blocks"], ["thinking"])
 
+    def test_extra_fields_reach_the_api(self):
+        client = FakeClient([[call("finish", 1, summary="ok")]])
+        planner.run(self.ctx, client, extra={"thinking": {"type": "disabled"}})
+        self.assertEqual(client.requests[0]["thinking"], {"type": "disabled"})
+
     def test_step_limit(self):
         loop = [[call("get_sessions", i, date_from="2026-09-29", date_to="2026-10-04")]
                 for i in range(planner.MAX_STEPS)]
