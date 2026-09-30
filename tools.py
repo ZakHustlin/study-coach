@@ -222,7 +222,8 @@ def move_session(ctx: Context, session_id: int, new_start: str, new_end: str) ->
 
 
 def add_item(ctx: Context, track_id: int, title: str, est_minutes: int,
-             due_date: str | None = None, after_item_id: int | None = None) -> dict:
+             due_date: str | None = None, after_item_id: int | None = None,
+             strand: str | None = None) -> dict:
     if ctx.new_items >= MAX_NEW_ITEMS_PER_RUN:
         raise ToolError(f"you've added {MAX_NEW_ITEMS_PER_RUN} items this run; that's the limit")
     if track_id not in {t["track_id"] for t in db.list_tracks(ctx.conn)}:
@@ -235,7 +236,7 @@ def add_item(ctx: Context, track_id: int, title: str, est_minutes: int,
         _parse_day(due_date, "due_date")
     try:
         item_id = db.add_item_after(ctx.conn, track_id, title.strip(), est_minutes,
-                                    after_item_id, due_date)
+                                    after_item_id, due_date, strand)
     except ValueError as e:
         raise ToolError(str(e))
     ctx.new_items += 1
@@ -332,7 +333,9 @@ SCHEMAS = [
         "input_schema": {"type": "object", "properties": {
             "track_id": {"type": "integer"}, "title": {"type": "string"},
             "est_minutes": {"type": "integer"}, "due_date": _DATE,
-            "after_item_id": {"type": "integer"}},
+            "after_item_id": {"type": "integer"},
+            "strand": {"type": "string", "description": "Same strand names the track "
+                       "already uses, e.g. 'odyssey'. Omit if the track has none."}},
             "required": ["track_id", "title", "est_minutes"]},
     },
     {

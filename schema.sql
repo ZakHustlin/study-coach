@@ -20,7 +20,8 @@ CREATE TABLE tracks (
     priority              INTEGER NOT NULL CHECK (priority BETWEEN 1 AND 5),   -- 5 = most important; ties allowed
     weekly_target_minutes INTEGER NOT NULL DEFAULT 0 CHECK (weekly_target_minutes >= 0),
     end_date              TEXT,                                                -- NULL = ongoing (e.g. TMUA exam date)
-    is_active             INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)) -- pause without deleting history
+    is_active             INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)), -- pause without deleting history
+    guidance              TEXT                                                 -- free-text instructions the planner follows for this track
 );
 
 -- A unit of work within a track: text section, maths topic, lecture, homework
@@ -33,6 +34,7 @@ CREATE TABLE items (
     due_date    TEXT,                              -- NULL unless it has a deadline (homework)
     status      TEXT    NOT NULL DEFAULT 'not_started'
                 CHECK (status IN ('not_started', 'in_progress', 'done')),
+    strand      TEXT,                              -- sub-area within a track, e.g. 'herodotus'; NULL if none
     FOREIGN KEY (track_id) REFERENCES tracks(track_id)
 );
 
@@ -116,4 +118,4 @@ BEGIN
 END;
 
 -- Schema version: must equal len(db.MIGRATIONS). Bump both together.
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;

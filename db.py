@@ -79,6 +79,11 @@ MIGRATIONS: list[str] = [
         SELECT RAISE(ABORT, 'session is locked');
     END;
     """,
+    # 2: per-track planner guidance, strands within a track
+    """
+    ALTER TABLE tracks ADD COLUMN guidance TEXT;
+    ALTER TABLE items ADD COLUMN strand TEXT;
+    """,
 ]
 
 
@@ -196,13 +201,21 @@ def day_summary(conn, day: str | None = None) -> list[dict]:
 # ---------------------------------------------------------------- tracks
 
 def add_track(conn, name: str, priority: int, weekly_target_minutes: int = 0,
-              end_date: str | None = None) -> int:
+              end_date: str | None = None, guidance: str | None = None) -> int:
     with transaction(conn):
         cur = conn.execute(
-            "INSERT INTO tracks (name, priority, weekly_target_minutes, end_date) "
-            "VALUES (?, ?, ?, ?)",
-            (name, priority, weekly_target_minutes, end_date))
+            "INSERT INTO tracks (name, priority, weekly_target_minutes, end_date, guidance) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (name, priority, weekly_target_minutes, end_date, guidance))
     return cur.lastrowid
+
+
+def set_track_guidance(conn, track_id: int, guidance: str | None) -> None:
+    """Change what the planner is told about a track, e.g. this half-term's school topic."""
+    with transaction(conn):
+        if conn.execute("UPDATE tracks SET guidance = ? WHERE track_id = ?",
+                        (guidance, track_id)).rowcount != 1:
+            raise ValueError(f"no track {track_id}")
 
 
 def list_tracks(conn, active_only: bool = True) -> list[dict]:
@@ -221,7 +234,8 @@ def set_track_active(conn, track_id: int, active: bool) -> None:
 # ---------------------------------------------------------------- items
 
 def add_item(conn, track_id: int, title: str, est_minutes: int,
-             position: int | None = None, due_date: str | None = None) -> int:
+             position: int | None = None, due_date: str | None = None,
+             strand: str | None = None) -> int:
     """Add an item. If position is omitted it goes to the end of its track."""
     with transaction(conn):
         if position is None:
@@ -229,18 +243,19 @@ def add_item(conn, track_id: int, title: str, est_minutes: int,
                 "SELECT COALESCE(MAX(position), 0) + 1 FROM items WHERE track_id = ?",
                 (track_id,)).fetchone()[0]
         cur = conn.execute(
-            "INSERT INTO items (track_id, title, est_minutes, position, due_date) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (track_id, title, est_minutes, position, due_date))
+            "INSERT INTO items (track_id, title, est_minutes, position, due_date, strand) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (track_id, title, est_minutes, position, due_date, strand))
     return cur.lastrowid
 
 
 def add_item_after(conn, track_id: int, title: str, est_minutes: int,
-                   after_item_id: int | None = None, due_date: str | None = None) -> int:
+                   after_item_id: int | None = None, due_date: str | None = None,
+                   strand: str | None = None) -> int:
     """Add an item straight after another in the same track, shifting the later
     items down one place. Without after_item_id it goes to the end."""
     if after_item_id is None:
-        return add_item(conn, track_id, title, est_minutes, due_date=due_date)
+        return add_item(conn, track_id, title, est_minutes, due_date=due_date, strand=strand)
     with transaction(conn):
         after = conn.execute("SELECT track_id, position FROM items WHERE item_id = ?",
                              (after_item_id,)).fetchone()
@@ -249,9 +264,9 @@ def add_item_after(conn, track_id: int, title: str, est_minutes: int,
         conn.execute("UPDATE items SET position = position + 1 "
                      "WHERE track_id = ? AND position > ?", (track_id, after["position"]))
         cur = conn.execute(
-            "INSERT INTO items (track_id, title, est_minutes, position, due_date) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (track_id, title, est_minutes, after["position"] + 1, due_date))
+            "INSERT INTO items (track_id, title, est_minutes, position, due_date, strand) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (track_id, title, est_minutes, after["position"] + 1, due_date, strand))
     return cur.lastrowid
 
 
@@ -261,7 +276,7 @@ def available_items(conn, now: str | None = None, track_id: int | None = None) -
     has gone into it and how much is already planned ahead, so the planner can
     decide whether to split it across sessions."""
     sql = """
-        SELECT i.item_id, t.track_id, t.name AS track, i.title, i.est_minutes,
+        SELECT i.item_id, t.track_id, t.name AS track, i.strand, i.title, i.est_minutes,
                i.due_date, i.status, i.position,
                (SELECT COALESCE(SUM(c.minutes_spent), 0) FROM completions c
                  WHERE c.item_id = i.item_id) AS minutes_spent,
@@ -587,6 +602,7 @@ def week_progress(conn, day: str | None = None, now: str | None = None) -> list[
     return _rows(conn.execute(
         """
         SELECT t.track_id, t.name AS track, t.priority, t.weekly_target_minutes,
+               t.end_date, t.guidance,
                (SELECT COALESCE(SUM(c.minutes_spent), 0)
                   FROM completions c JOIN items i ON i.item_id = c.item_id
                  WHERE i.track_id = t.track_id
@@ -599,6 +615,40 @@ def week_progress(conn, day: str | None = None, now: str | None = None) -> list[
         WHERE t.is_active = 1
         ORDER BY t.priority DESC, t.track_id
         """, {"start": start, "end": end, "now": now}))
+
+
+def strand_balance(conn, today: str | None = None) -> list[dict]:
+    """For tracks that use strands: minutes logged per strand in the last 14 days and
+    the last day each strand was touched, so the planner can rotate fairly."""
+    return _rows(conn.execute(
+        """
+        SELECT t.name AS track, i.strand,
+               COALESCE(SUM(CASE WHEN c.logged_at >= date(:today, '-14 days')
+                                 THEN c.minutes_spent END), 0) AS minutes_14d,
+               MAX(date(c.logged_at)) AS last_touched
+        FROM items i
+        JOIN tracks t ON t.track_id = i.track_id
+        LEFT JOIN completions c ON c.item_id = i.item_id AND c.minutes_spent > 0
+        WHERE i.strand IS NOT NULL AND t.is_active = 1
+        GROUP BY t.track_id, i.strand
+        ORDER BY t.name, minutes_14d
+        """, {"today": _today(today)}))
+
+
+def cancel_future_sessions(conn, now: str | None = None) -> int:
+    """Cancel every planned, unlocked session that hasn't started. Used before wiping
+    the database so `gcal.py sync` removes their calendar events first."""
+    with transaction(conn):
+        cur = conn.execute(
+            "UPDATE sessions SET status = 'cancelled' "
+            "WHERE status = 'planned' AND locked = 0 AND start_at >= ?", (now or _now(),))
+    return cur.rowcount
+
+
+def load_sql(conn, path: str | Path) -> None:
+    """Run a SQL file of INSERTs (e.g. my_data.sql) in one transaction."""
+    conn.executescript("BEGIN;\n" + Path(path).read_text() + "\nCOMMIT;")
+    conn.execute("PRAGMA foreign_keys = ON")
 
 
 # ---------------------------------------------------------------- planner snapshot
@@ -628,11 +678,15 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser(description="Study coach database")
     p.add_argument("command",
                    choices=["init", "seed", "snapshot", "version",
-                            "proposals", "approve", "reject", "priorities"],
+                            "proposals", "approve", "reject", "priorities",
+                            "load", "cancel-future", "guidance"],
                    help="init: empty db | seed: fake data | snapshot: planner view | "
                         "version: schema version | proposals: list pending | "
-                        "approve/reject ID | priorities [TEXT]: show or set this week's")
-    p.add_argument("arg", nargs="?", help="proposal id, or priorities text")
+                        "approve/reject ID | priorities [TEXT]: show or set this week's | "
+                        "load FILE: run a SQL file | cancel-future: cancel all future "
+                        "sessions | guidance TRACK_ID TEXT: set a track's planner notes")
+    p.add_argument("arg", nargs="?", help="proposal id, priorities text, file or track id")
+    p.add_argument("text", nargs="?", help="guidance text")
     p.add_argument("--db", default=str(DEFAULT_DB))
     p.add_argument("--today", help="YYYY-MM-DD (default: real today)")
     args = p.parse_args()
@@ -651,6 +705,16 @@ if __name__ == "__main__":
         print(f"#{pr['proposal_id']} {pr['status']}"
               + ("  - run `python gcal.py sync`" if pr["action"] == "cancel_session"
                  and pr["status"] == "approved" else ""))
+    elif args.command == "load":
+        load_sql(conn, args.arg)
+        print(f"Loaded {args.arg}: {len(list_tracks(conn, active_only=False))} tracks, "
+              f"{len(list_items(conn, include_done=True))} items")
+    elif args.command == "cancel-future":
+        print(f"Cancelled {cancel_future_sessions(conn)} session(s). "
+              f"Now run `python gcal.py sync` to remove them from your calendar.")
+    elif args.command == "guidance":
+        set_track_guidance(conn, int(args.arg), args.text)
+        print(f"Track {args.arg}: {args.text}")
     elif args.command == "priorities":
         if args.arg:
             set_weekly_priorities(conn, args.arg, args.today)

@@ -65,8 +65,14 @@ the rest of his week (up to the date in `plan_until`) across his study tracks.
 How to plan
 - Start from the state in the first message: tracks, weekly targets and progress, \
 this week's priorities (if Zak set any), sessions already planned, free time.
+- Each track's `guidance` is Zak's instructions for that track. Follow it: it \
+overrides the general rules below (e.g. "every day, 30 min" means spread, not batch).
 - Weekly priorities from Zak come first. Then deadlines. Then tracks furthest behind \
 their weekly target, weighted by track priority (5 = most important).
+- Tracks with strands: rotate between them using `strand_balance_14d`, favouring the \
+strand with the fewest recent minutes or the oldest last_touched.
+- Some items are open-ended (a very large estimate, e.g. a whole book or ongoing \
+vocab work). Keep scheduling chunks of them; never propose marking them done.
 - Keep what's already planned unless there's a reason to change it. Don't churn the \
 calendar: move a session only if it clearly improves the week.
 - Prefer 45-90 minute sessions. Split items bigger than ~90 minutes across days. \
@@ -77,8 +83,12 @@ reason to add a short revision item.
 - Work out the whole layout first, day by day, then book it in time order. Anything \
 that follows on from other work (marking a paper, reviewing a topic) goes after that \
 work, never before. Don't book something and then move it in the same run.
-- Every session needs a brief: 1-3 concrete sentences saying what to do, e.g. \
-"Do questions 1-10 of the paper under timed conditions, then mark them."
+- Every session needs a brief. Zak pastes it into an AI tutor to run the session, \
+so write it as that request: what to open (text, pages, lines, spec point), the \
+task, and what "done" looks like, in 1-3 sentences. E.g. "Quiz me on the fetch-\
+decode-execute cycle and the role of each register (OCR 1.1.1), then set 5 exam-\
+style questions and mark my answers." For open-ended items, pick the next \
+concrete chunk (e.g. "Read pages 60-90 of the Odyssey") based on the item history.
 
 Rules
 - Tools enforce the hard rules (free time, daily cap, gaps, due dates, locked \
@@ -105,6 +115,7 @@ def initial_state(ctx: tools.Context) -> dict:
         "plan_until": until,
         "weekly_priorities": snap["weekly_priorities"] or "(Zak hasn't set any this week)",
         "tracks_this_week": db.week_progress(ctx.conn, today, ctx.now),
+        "strand_balance_14d": db.strand_balance(ctx.conn, today),
         "planned_sessions": tools.get_sessions(ctx, today, until)["sessions"],
         "free_time": tools.get_free_slots(ctx, today, until)["days"],
         "available_items": db.available_items(ctx.conn, ctx.now),
