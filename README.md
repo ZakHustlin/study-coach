@@ -21,6 +21,9 @@ and re-plans from what actually got done.
 | `test_tools.py` | Tests for every planner rule |
 | `planner.py` | The evening re-plan: the LLM tool loop |
 | `test_planner.py` | Loop tests with a scripted fake model (no API key needed) |
+| `checkin.py` | Evening check-in flow (screens + button handling), chat-app independent |
+| `bot.py` | Telegram bot: 22:00 check-in, commands, re-plan + calendar sync |
+| `test_checkin.py` | Check-in tests (no Telegram needed) |
 | `test_calendar.py` | Tests for free slots and sync (uses a fake calendar) |
 
 ## Commands
@@ -49,6 +52,9 @@ python gcal.py free      # free slots for the next 7 days
 # Planner: needs DEEPSEEK_API_KEY=... in .env (or PLANNER_PROVIDER=anthropic + ANTHROPIC_API_KEY)
 python planner.py --dry-run   # plan on a copy of coach.db, change nothing
 python planner.py             # plan for real, then: python gcal.py sync
+
+# Telegram bot: needs TELEGRAM_BOT_TOKEN in .env; send /start from your phone first
+python bot.py                 # keeps running; check-in at 22:00, /help for commands
 ```
 
 `coach.db` is gitignored because it holds personal data.

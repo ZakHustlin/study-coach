@@ -299,6 +299,65 @@ def save_log(result: RunResult, now: str, dry_run: bool) -> Path:
     return path
 
 
+class PlannerError(Exception):
+    """A problem worth showing the user as one line (bad key, no connection...)."""
+
+
+@dataclass
+class LLM:
+    name: str
+    client: object
+    model: str
+    prices: dict
+    extra: dict
+    thinking: str
+
+
+def setup_llm(model: str | None = None, thinking: str | None = None) -> LLM:
+    """Build the API client from .env. Shared by the CLI and the Telegram bot."""
+    load_env()
+    name = os.environ.get("PLANNER_PROVIDER", DEFAULT_PROVIDER)
+    if name not in PROVIDERS:
+        raise PlannerError(f"PLANNER_PROVIDER must be one of {', '.join(PROVIDERS)}")
+    provider = PROVIDERS[name]
+    key = os.environ.get(provider["key_env"])
+    if not key:
+        raise PlannerError(f"No {provider['key_env']}. Add it to .env (see README).")
+    import anthropic                       # imported here so tests don't need it
+    # PLANNER_THINKING=off asks the model to answer without a hidden reasoning phase.
+    # Cheaper and can't overflow, but may plan less carefully: compare with --dry-run.
+    thinking = (thinking or os.environ.get("PLANNER_THINKING", "on")).lower()
+    return LLM(name=name,
+               client=anthropic.Anthropic(api_key=key, base_url=provider["base_url"]),
+               model=model or os.environ.get("PLANNER_MODEL", provider["model"]),
+               prices=provider["prices"],
+               extra={"thinking": {"type": "disabled"}} if thinking == "off" else {},
+               thinking=thinking)
+
+
+def replan(conn, llm: LLM, now: str, dry_run: bool = False, verbose: bool = False) -> RunResult:
+    """One evening re-plan against conn. Raises PlannerError on API problems."""
+    import anthropic
+    if not dry_run:
+        # Unanswered proposals from earlier days were about a plan that has moved on.
+        db.expire_proposals(conn, created_before=now[:10])
+    ctx = tools.Context(conn, availability.load_config(), now)
+    if verbose:
+        print(f"Planning {ctx.today} -> {ctx.horizon_end} with {llm.model}, "
+              f"thinking {llm.thinking}{' (DRY RUN)' if dry_run else ''}")
+    try:
+        result = run(ctx, llm.client, llm.model, verbose=verbose, prices=llm.prices,
+                     extra=llm.extra)
+    except anthropic.AuthenticationError:
+        raise PlannerError(f"{llm.name} rejected the API key. Check {PROVIDERS[llm.name]['key_env']} in .env.")
+    except anthropic.APIConnectionError:
+        raise PlannerError(f"Couldn't reach {llm.name}. Check the internet connection.")
+    except anthropic.APIStatusError as e:
+        raise PlannerError(f"{llm.name} returned an error ({e.status_code}): {e.message}")
+    save_log(result, now, dry_run)
+    return result
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Evening re-plan")
     p.add_argument("--dry-run", action="store_true", help="plan on a copy; change nothing")
@@ -309,45 +368,17 @@ def main() -> None:
     p.add_argument("--thinking", choices=["on", "off"], help="default: PLANNER_THINKING or on")
     args = p.parse_args()
 
-    load_env()
-    name = os.environ.get("PLANNER_PROVIDER", DEFAULT_PROVIDER)
-    if name not in PROVIDERS:
-        raise SystemExit(f"PLANNER_PROVIDER must be one of {', '.join(PROVIDERS)}")
-    provider = PROVIDERS[name]
-    key = os.environ.get(provider["key_env"])
-    if not key:
-        raise SystemExit(f"No {provider['key_env']}. Add it to .env (see README).")
-    import anthropic                       # imported here so tests don't need it
-    client = anthropic.Anthropic(api_key=key, base_url=provider["base_url"])
-    model = args.model or os.environ.get("PLANNER_MODEL", provider["model"])
-    # PLANNER_THINKING=off asks the model to answer without a hidden reasoning phase.
-    # Cheaper and can't overflow, but may plan less carefully: compare with --dry-run.
-    thinking = (args.thinking or os.environ.get("PLANNER_THINKING", "on")).lower()
-    extra = {"thinking": {"type": "disabled"}} if thinking == "off" else {}
-
     now = args.now or db.local_now().strftime(tools.FMT)
     conn = copy_db(Path(args.db)) if args.dry_run else db.connect(args.db)
-    if not args.dry_run:
-        # Unanswered proposals from earlier days were about a plan that has moved on.
-        db.expire_proposals(conn, created_before=now[:10])
-
-    ctx = tools.Context(conn, availability.load_config(), now)
-    print(f"Planning {ctx.today} -> {ctx.horizon_end} with {model}, thinking {thinking}"
-          f"{' (DRY RUN)' if args.dry_run else ''}")
     try:
-        result = run(ctx, client, model, verbose=not args.quiet, prices=provider["prices"],
-                     extra=extra)
-    except anthropic.AuthenticationError:
-        raise SystemExit(f"{name} rejected the API key. Check {provider['key_env']} in .env.")
-    except anthropic.APIConnectionError:
-        raise SystemExit(f"Couldn't reach {name}. Check your internet connection.")
-    except anthropic.APIStatusError as e:
-        raise SystemExit(f"{name} returned an error ({e.status_code}): {e.message}")
+        llm = setup_llm(args.model, args.thinking)
+        result = replan(conn, llm, now, args.dry_run, verbose=not args.quiet)
+    except PlannerError as e:
+        raise SystemExit(str(e))
 
     print("\n" + result.summary)
     print(f"\n{len(result.changes)} change(s), {result.steps} step(s), "
           f"{sum(result.usage.values()):,} tokens, ~${result.cost_usd:.3f}")
-    print(f"Log: {save_log(result, now, args.dry_run).relative_to(ROOT)}")
     if not args.dry_run and result.changes:
         print("Run `python gcal.py sync` to update your calendar.")
 
