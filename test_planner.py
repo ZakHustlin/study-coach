@@ -73,7 +73,8 @@ class PlannerLoopTest(unittest.TestCase):
         client = FakeClient([[call("finish", 1, summary="Nothing to change.")]])
         planner.run(self.ctx, client)
         first = client.requests[0]["messages"][0]["content"]
-        for key in ("plan_until", "tracks_this_week", "free_time", "available_items"):
+        for key in ("plan_until", "tracks_this_week", "free_time", "available_items",
+                    "standing_rules"):
             self.assertIn(key, first)
         self.assertIn("cache_control", client.requests[0]["tools"][-1])
 

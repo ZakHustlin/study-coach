@@ -5,6 +5,7 @@
 PRAGMA foreign_keys = ON;
 
 -- Drop children before parents
+DROP TABLE IF EXISTS rules;
 DROP TABLE IF EXISTS passages;
 DROP TABLE IF EXISTS proposals;
 DROP TABLE IF EXISTS weekly_priorities;
@@ -113,6 +114,16 @@ CREATE TABLE passages (
     FOREIGN KEY (track_id) REFERENCES tracks(track_id)
 );
 
+-- My standing instructions to the planner ("no maths on Friday evenings").
+-- Soft rules: the model follows them. Hard limits (times, caps) live in fixed.json.
+-- Only I write these; the planner has no tool to change them.
+CREATE TABLE rules (
+    rule_id    INTEGER PRIMARY KEY,
+    text       TEXT    NOT NULL,
+    created_at TEXT    NOT NULL,
+    active     INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1))  -- removed = 0, kept for history
+);
+
 CREATE INDEX idx_items_track        ON items(track_id);
 CREATE INDEX idx_sessions_start     ON sessions(start_at);
 CREATE INDEX idx_completions_item   ON completions(item_id, logged_at);
@@ -132,4 +143,4 @@ BEGIN
 END;
 
 -- Schema version: must equal len(db.MIGRATIONS). Bump both together.
-PRAGMA user_version = 3;
+PRAGMA user_version = 4;

@@ -97,6 +97,15 @@ MIGRATIONS: list[str] = [
         FOREIGN KEY (track_id) REFERENCES tracks(track_id)
     );
     """,
+    # 4: standing rules I give the planner
+    """
+    CREATE TABLE rules (
+        rule_id    INTEGER PRIMARY KEY,
+        text       TEXT    NOT NULL,
+        created_at TEXT    NOT NULL,
+        active     INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1))  -- removed = 0, kept for history
+    );
+    """,
 ]
 
 
@@ -685,6 +694,28 @@ def coverage(conn) -> list[dict]:
     return out
 
 
+def add_rule(conn, text: str) -> int:
+    if not text or not text.strip():
+        raise ValueError("rule text is empty")
+    with transaction(conn):
+        cur = conn.execute("INSERT INTO rules (text, created_at) VALUES (?, ?)",
+                           (text.strip(), _now()))
+    return cur.lastrowid
+
+
+def list_rules(conn, include_removed: bool = False) -> list[dict]:
+    sql = "SELECT * FROM rules" + ("" if include_removed else " WHERE active = 1")
+    return _rows(conn.execute(sql + " ORDER BY rule_id"))
+
+
+def remove_rule(conn, rule_id: int) -> None:
+    """Switch a rule off. Kept (inactive) so you can see what you used to ask for."""
+    with transaction(conn):
+        if conn.execute("UPDATE rules SET active = 0 WHERE rule_id = ? AND active = 1",
+                        (rule_id,)).rowcount != 1:
+            raise ValueError(f"no active rule {rule_id}")
+
+
 def cancel_future_sessions(conn, now: str | None = None) -> int:
     """Cancel every planned, unlocked session that hasn't started. Used before wiping
     the database so `gcal.py sync` removes their calendar events first."""
@@ -731,7 +762,7 @@ if __name__ == "__main__":
                             "proposals", "approve", "reject", "priorities",
                             "load", "cancel-future", "guidance",
                             "add-homework", "add-item", "items",
-                            "passages", "covered"],
+                            "passages", "covered", "rule"],
                    help="init: empty db | seed: fake data | snapshot: planner view | "
                         "version: schema version | proposals: list pending | "
                         "approve/reject ID | priorities [TEXT]: show or set this week's | "
@@ -795,6 +826,23 @@ if __name__ == "__main__":
                            due_date=due, strand=args.strand)
         print(f"Added item {item_id} to {track['name']}: {title} ({minutes} min"
               + (f", due {due}" if due else "") + (f", strand {args.strand}" if args.strand else "") + ")")
+    elif args.command == "rule":
+        # rule list | rule add "TEXT" | rule remove ID
+        action = args.arg or "list"
+        try:
+            if action == "add":
+                print(f"Rule {add_rule(conn, args.text)} added. It applies from the next re-plan.")
+            elif action == "remove":
+                remove_rule(conn, int(args.text))
+                print(f"Rule {args.text} removed.")
+            elif action != "list":
+                raise SystemExit('usage: rule list | rule add "TEXT" | rule remove ID')
+        except ValueError as e:
+            raise SystemExit(str(e))
+        for r in list_rules(conn):
+            print(f"{r['rule_id']:>3}  {r['text']}")
+        if not list_rules(conn):
+            print("(no rules)")
     elif args.command == "passages":
         for r in list_passages(conn, args.arg):
             print(f"{r['passage_id']:>4}  {r['strand']:<10} {r['ref']:<20} "

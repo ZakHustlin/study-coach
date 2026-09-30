@@ -114,6 +114,19 @@ class PlannerTablesTest(unittest.TestCase):
         self.assertEqual(cov["next_in_class"], "Od. 16.251-275")
         self.assertEqual(db.mark_covered(self.conn, pid), 0)   # already covered
 
+    def test_rules(self):
+        rid = db.add_rule(self.conn, "  No maths on Friday evenings ")
+        db.add_rule(self.conn, "Greek before CS on the same night")
+        self.assertEqual([r["text"] for r in db.list_rules(self.conn)],
+                         ["No maths on Friday evenings", "Greek before CS on the same night"])
+        db.remove_rule(self.conn, rid)
+        self.assertEqual(len(db.list_rules(self.conn)), 1)
+        self.assertEqual(len(db.list_rules(self.conn, include_removed=True)), 2)
+        with self.assertRaises(ValueError):
+            db.remove_rule(self.conn, rid)
+        with self.assertRaises(ValueError):
+            db.add_rule(self.conn, "   ")
+
     def test_weekly_priorities(self):
         self.assertEqual(db.week_start("2026-10-04"), "2026-09-28")   # Sunday -> its Monday
         db.set_weekly_priorities(self.conn, "TMUA paper 1; Greek homework", "2026-09-30")
