@@ -6,6 +6,9 @@
   },
   "buffer_minutes": 15,
   "min_slot_minutes": 30,
+  "session_gap_minutes": 10,
+  "daily_cap_minutes": {"weekday": 180, "weekend": 360},
+  "session_minutes": {"min": 20, "max": 180},
   "fixed": [
     {"label": "School", "days": ["mon", "tue", "wed", "fri"], "start": "07:00", "end": "17:00"},
     {"label": "School", "days": ["thu"], "start": "07:00", "end": "18:00"},

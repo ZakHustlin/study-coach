@@ -17,6 +17,8 @@ and re-plans from what actually got done.
 | `fixed.json` | Fixed commitments and study windows (edit this when your week changes) |
 | `availability.py` | Works out free slots from `fixed.json` and planned sessions |
 | `gcal.py` | Google Calendar: sign-in, the Study (agent) calendar, sync |
+| `tools.py` | The planner's tools: what the LLM can see and do, and the hard rules it can't break |
+| `test_tools.py` | Tests for every planner rule |
 | `test_calendar.py` | Tests for free slots and sync (uses a fake calendar) |
 
 ## Commands

@@ -224,6 +224,59 @@ def add_item(conn, track_id: int, title: str, est_minutes: int,
     return cur.lastrowid
 
 
+def add_item_after(conn, track_id: int, title: str, est_minutes: int,
+                   after_item_id: int | None = None, due_date: str | None = None) -> int:
+    """Add an item straight after another in the same track, shifting the later
+    items down one place. Without after_item_id it goes to the end."""
+    if after_item_id is None:
+        return add_item(conn, track_id, title, est_minutes, due_date=due_date)
+    with transaction(conn):
+        after = conn.execute("SELECT track_id, position FROM items WHERE item_id = ?",
+                             (after_item_id,)).fetchone()
+        if after is None or after["track_id"] != track_id:
+            raise ValueError(f"item {after_item_id} is not in track {track_id}")
+        conn.execute("UPDATE items SET position = position + 1 "
+                     "WHERE track_id = ? AND position > ?", (track_id, after["position"]))
+        cur = conn.execute(
+            "INSERT INTO items (track_id, title, est_minutes, position, due_date) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (track_id, title, est_minutes, after["position"] + 1, due_date))
+    return cur.lastrowid
+
+
+def available_items(conn, now: str | None = None, track_id: int | None = None) -> list[dict]:
+    """Every item that can be worked on now (not just the first per track, unlike
+    next_items): not done, dependencies done, track active. Includes how much time
+    has gone into it and how much is already planned ahead, so the planner can
+    decide whether to split it across sessions."""
+    sql = """
+        SELECT i.item_id, t.track_id, t.name AS track, i.title, i.est_minutes,
+               i.due_date, i.status, i.position,
+               (SELECT COALESCE(SUM(c.minutes_spent), 0) FROM completions c
+                 WHERE c.item_id = i.item_id) AS minutes_spent,
+               (SELECT COALESCE(SUM((julianday(s.end_at) - julianday(s.start_at)) * 1440), 0)
+                  FROM sessions s
+                 WHERE s.item_id = i.item_id AND s.status = 'planned' AND s.start_at >= :now
+               ) AS minutes_planned_ahead
+        FROM items i
+        JOIN tracks t ON t.track_id = i.track_id
+        WHERE t.is_active = 1
+          AND i.status <> 'done'
+          AND NOT EXISTS (
+              SELECT 1 FROM item_dependencies d
+              JOIN items dep ON dep.item_id = d.depends_on_id
+              WHERE d.item_id = i.item_id AND dep.status <> 'done')
+    """
+    params: dict = {"now": now or _now()}
+    if track_id is not None:
+        sql += " AND i.track_id = :track_id"
+        params["track_id"] = track_id
+    rows = _rows(conn.execute(sql + " ORDER BY t.priority DESC, i.position, i.item_id", params))
+    for r in rows:
+        r["minutes_planned_ahead"] = round(r["minutes_planned_ahead"])
+    return rows
+
+
 def get_item(conn, item_id: int) -> dict | None:
     row = conn.execute("SELECT * FROM items WHERE item_id = ?", (item_id,)).fetchone()
     return dict(row) if row else None
@@ -282,6 +335,24 @@ def plan_session(conn, item_id: int, start_at: str, end_at: str,
         cur = conn.execute(
             "INSERT INTO sessions (item_id, start_at, end_at, brief, locked) VALUES (?, ?, ?, ?, ?)",
             (item_id, start_at, end_at, brief, int(locked)))
+    return cur.lastrowid
+
+
+def move_session(conn, session_id: int, start_at: str, end_at: str) -> int:
+    """Re-plan a session at a new time: cancel the old row and create a new one with
+    the same item, brief and lock, in ONE transaction. Returns the new session_id.
+    (Cancel + new rather than editing the times keeps the history and fits the
+    one-way calendar sync, which deletes the old event and creates the new one.)"""
+    with transaction(conn):
+        old = conn.execute("SELECT * FROM sessions WHERE session_id = ?",
+                           (session_id,)).fetchone()
+        if old is None or old["status"] != "planned":
+            raise ValueError(f"session {session_id} is not a planned session")
+        conn.execute("UPDATE sessions SET status = 'cancelled' WHERE session_id = ?",
+                     (session_id,))   # the locked trigger fires here if it's locked
+        cur = conn.execute(
+            "INSERT INTO sessions (item_id, start_at, end_at, brief, locked) VALUES (?, ?, ?, ?, ?)",
+            (old["item_id"], start_at, end_at, old["brief"], old["locked"]))
     return cur.lastrowid
 
 
