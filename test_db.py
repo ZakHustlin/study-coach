@@ -95,7 +95,8 @@ class DataLayerTest(unittest.TestCase):
     def test_planner_snapshot_has_everything(self):
         snap = db.planner_snapshot(self.conn, TODAY)
         self.assertEqual(set(snap), {"today", "tracks", "next_items", "completion_rates_14d",
-                                     "estimate_accuracy", "needs_review", "today_summary"})
+                                     "estimate_accuracy", "needs_review", "today_summary",
+                                     "weekly_priorities", "pending_proposals"})
 
 
 if __name__ == "__main__":

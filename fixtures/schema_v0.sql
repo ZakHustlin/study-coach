@@ -1,3 +1,6 @@
+-- Frozen copy of schema.sql at version 0 (before migration 1). Used only by
+-- test_migrations.py to check that migrating an old database gives the same
+-- schema as building a new one. Never edit.
 -- Study Coach schema (SQLite)
 -- Rebuild: python -c "import sqlite3; c=sqlite3.connect('coach.db'); c.executescript(open('schema.sql').read())"
 -- All durations in minutes. All dates/times as ISO text: 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM' (local time).
@@ -5,8 +8,6 @@
 PRAGMA foreign_keys = ON;
 
 -- Drop children before parents
-DROP TABLE IF EXISTS proposals;
-DROP TABLE IF EXISTS weekly_priorities;
 DROP TABLE IF EXISTS completions;
 DROP TABLE IF EXISTS sessions;
 DROP TABLE IF EXISTS item_dependencies;
@@ -55,8 +56,6 @@ CREATE TABLE sessions (
     calendar_event_id TEXT    UNIQUE,              -- NULL until written to Google Calendar
     status            TEXT    NOT NULL DEFAULT 'planned'
                       CHECK (status IN ('planned', 'cancelled')),  -- cancelled = removed by re-plan, not counted
-    brief             TEXT,                        -- lesson prompt from the planner, shown in the calendar event
-    locked            INTEGER NOT NULL DEFAULT 0 CHECK (locked IN (0, 1)),  -- 1 = pinned by me, planner can't touch
     CHECK (end_at > start_at),
     FOREIGN KEY (item_id) REFERENCES items(item_id)
 );
@@ -75,45 +74,6 @@ CREATE TABLE completions (
     FOREIGN KEY (session_id) REFERENCES sessions(session_id)
 );
 
--- Actions the planner wants but may not do alone. It proposes; I approve or reject.
--- Every current action targets exactly one row, so target_id is a plain integer
--- rather than a JSON blob: easy to validate and to query.
-CREATE TABLE proposals (
-    proposal_id INTEGER PRIMARY KEY,
-    created_at  TEXT    NOT NULL,
-    action      TEXT    NOT NULL
-                CHECK (action IN ('cancel_session', 'pause_track', 'mark_item_done')),
-    target_id   INTEGER NOT NULL,                  -- session_id / track_id / item_id, depending on action
-    reason      TEXT    NOT NULL,                  -- the planner's justification, shown to me
-    status      TEXT    NOT NULL DEFAULT 'pending'
-                CHECK (status IN ('pending', 'approved', 'rejected', 'expired')),
-    decided_at  TEXT                               -- NULL while pending
-);
-
--- My answer to "what matters this week?", read by every re-plan that week.
-CREATE TABLE weekly_priorities (
-    week_start TEXT PRIMARY KEY,                   -- the Monday, 'YYYY-MM-DD'
-    priorities TEXT NOT NULL,
-    set_at     TEXT NOT NULL
-);
-
 CREATE INDEX idx_items_track        ON items(track_id);
 CREATE INDEX idx_sessions_start     ON sessions(start_at);
 CREATE INDEX idx_completions_item   ON completions(item_id, logged_at);
--- Stops the nightly planner piling up the same proposal every evening
-CREATE UNIQUE INDEX idx_proposals_one_pending
-    ON proposals(action, target_id) WHERE status = 'pending';
-
--- Defence in depth: the planner's tools already refuse locked sessions, but this
--- makes the database itself refuse to move, re-item or cancel one. To change a
--- locked session, unlock it first (a separate UPDATE). Calendar sync can still
--- set calendar_event_id because that column isn't checked.
-CREATE TRIGGER sessions_locked_guard
-BEFORE UPDATE OF item_id, start_at, end_at, status ON sessions
-WHEN OLD.locked = 1 AND NEW.locked = 1
-BEGIN
-    SELECT RAISE(ABORT, 'session is locked');
-END;
-
--- Schema version: must equal len(db.MIGRATIONS). Bump both together.
-PRAGMA user_version = 1;

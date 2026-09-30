@@ -98,9 +98,11 @@ def event_body(session: dict, tz: str) -> dict:
     def iso(s: str) -> str:
         return datetime.strptime(s, FMT).isoformat()
 
+    footer = f"Planned by study coach (session {session['session_id']})."
+    brief = (session.get("brief") or "").strip()
     return {
         "summary": f"{session['track']}: {session['title']}",
-        "description": f"Planned by study coach (session {session['session_id']}).",
+        "description": f"{brief}\n\n{footer}" if brief else footer,
         "start": {"dateTime": iso(session["start_at"]), "timeZone": tz},
         "end":   {"dateTime": iso(session["end_at"]),   "timeZone": tz},
         "extendedProperties": {"private": {"session_id": str(session["session_id"])}},

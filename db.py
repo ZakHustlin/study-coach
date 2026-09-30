@@ -26,11 +26,81 @@ DEFAULT_DB = ROOT / "coach.db"
 
 def connect(path: str | Path = DEFAULT_DB) -> sqlite3.Connection:
     """Open a connection with foreign keys enforced (SQLite has them OFF by default,
-    per connection) and rows accessible by column name."""
+    per connection) and rows accessible by column name. Brings an older database
+    up to the current schema, so no caller can run against a stale one."""
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    migrate(conn)
     return conn
+
+
+# ---------------------------------------------------------------- migrations
+#
+# schema.sql always describes the *current* schema, for building a fresh database.
+# MIGRATIONS turns an *existing* database into that same shape without losing rows.
+# PRAGMA user_version (an integer SQLite stores in the file header) records how many
+# migrations a database has had. Rule: every schema change = edit schema.sql AND
+# append one migration here AND bump the user_version line at the end of schema.sql.
+# Never edit a migration once it's been run on the real coach.db - add a new one.
+
+MIGRATIONS: list[str] = [
+    # 1: planner support - lesson briefs, locked sessions, proposals, weekly priorities
+    """
+    ALTER TABLE sessions ADD COLUMN brief TEXT;
+    ALTER TABLE sessions ADD COLUMN locked INTEGER NOT NULL DEFAULT 0 CHECK (locked IN (0, 1));
+
+    CREATE TABLE proposals (
+        proposal_id INTEGER PRIMARY KEY,
+        created_at  TEXT    NOT NULL,
+        action      TEXT    NOT NULL
+                    CHECK (action IN ('cancel_session', 'pause_track', 'mark_item_done')),
+        target_id   INTEGER NOT NULL,
+        reason      TEXT    NOT NULL,
+        status      TEXT    NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending', 'approved', 'rejected', 'expired')),
+        decided_at  TEXT
+    );
+
+    CREATE TABLE weekly_priorities (
+        week_start TEXT PRIMARY KEY,
+        priorities TEXT NOT NULL,
+        set_at     TEXT NOT NULL
+    );
+
+    CREATE UNIQUE INDEX idx_proposals_one_pending
+        ON proposals(action, target_id) WHERE status = 'pending';
+
+    CREATE TRIGGER sessions_locked_guard
+    BEFORE UPDATE OF item_id, start_at, end_at, status ON sessions
+    WHEN OLD.locked = 1 AND NEW.locked = 1
+    BEGIN
+        SELECT RAISE(ABORT, 'session is locked');
+    END;
+    """,
+]
+
+
+def schema_version(conn) -> int:
+    return conn.execute("PRAGMA user_version").fetchone()[0]
+
+
+def migrate(conn) -> list[int]:
+    """Apply any migrations this database hasn't had yet. Returns the numbers applied.
+    An empty database (no tables yet) is left alone: init_db builds it at the
+    current version straight from schema.sql."""
+    has_tables = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sessions'").fetchone()
+    if not has_tables:
+        return []
+    applied = []
+    for number in range(schema_version(conn) + 1, len(MIGRATIONS) + 1):
+        # Each migration runs as one transaction together with its version bump, so a
+        # failure halfway leaves the database exactly as it was before (atomicity).
+        conn.executescript(f"BEGIN;\n{MIGRATIONS[number - 1]}\nPRAGMA user_version = {number};\nCOMMIT;")
+        applied.append(number)
+    conn.execute("PRAGMA foreign_keys = ON")  # executescript can reset it
+    return applied
 
 
 @contextmanager
@@ -204,12 +274,26 @@ def add_dependency(conn, item_id: int, depends_on_id: int) -> None:
 
 # ---------------------------------------------------------------- sessions
 
-def plan_session(conn, item_id: int, start_at: str, end_at: str) -> int:
+def plan_session(conn, item_id: int, start_at: str, end_at: str,
+                 brief: str | None = None, locked: bool = False) -> int:
+    """brief: the lesson prompt for the calendar event. locked: pinned by me, so
+    the planner may not move or cancel it."""
     with transaction(conn):
         cur = conn.execute(
-            "INSERT INTO sessions (item_id, start_at, end_at) VALUES (?, ?, ?)",
-            (item_id, start_at, end_at))
+            "INSERT INTO sessions (item_id, start_at, end_at, brief, locked) VALUES (?, ?, ?, ?, ?)",
+            (item_id, start_at, end_at, brief, int(locked)))
     return cur.lastrowid
+
+
+def get_session(conn, session_id: int) -> dict | None:
+    row = conn.execute("SELECT * FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def set_session_locked(conn, session_id: int, locked: bool) -> None:
+    with transaction(conn):
+        conn.execute("UPDATE sessions SET locked = ? WHERE session_id = ?",
+                     (int(locked), session_id))
 
 
 def set_calendar_event_id(conn, session_id: int, event_id: str) -> None:
@@ -222,7 +306,8 @@ def set_calendar_event_id(conn, session_id: int, event_id: str) -> None:
 def cancel_session(conn, session_id: int) -> dict:
     """Mark a session cancelled (a re-plan removed it). Kept, not deleted, but it no
     longer counts as 'planned' in completion rates. Returns the row so the caller
-    can delete the matching calendar event."""
+    can delete the matching calendar event. Raises sqlite3.IntegrityError if the
+    session is locked - unlock it first."""
     with transaction(conn):
         conn.execute("UPDATE sessions SET status = 'cancelled' WHERE session_id = ?",
                      (session_id,))
@@ -329,6 +414,85 @@ def item_history(conn, item_id: int) -> list[dict]:
         "SELECT * FROM completions WHERE item_id = ? ORDER BY logged_at", (item_id,)))
 
 
+# ---------------------------------------------------------------- proposals
+
+PROPOSAL_ACTIONS = {
+    # action -> SQL run when I approve it
+    "cancel_session": "UPDATE sessions SET status = 'cancelled' WHERE session_id = ?",
+    "pause_track":    "UPDATE tracks SET is_active = 0 WHERE track_id = ?",
+    "mark_item_done": "UPDATE items SET status = 'done' WHERE item_id = ?",
+}
+
+
+def create_proposal(conn, action: str, target_id: int, reason: str) -> int:
+    """The planner asks for something it may not do alone. Raises
+    sqlite3.IntegrityError if the same proposal is already pending."""
+    with transaction(conn):
+        cur = conn.execute(
+            "INSERT INTO proposals (created_at, action, target_id, reason) VALUES (?, ?, ?, ?)",
+            (_now(), action, target_id, reason))
+    return cur.lastrowid
+
+
+def pending_proposals(conn) -> list[dict]:
+    return _rows(conn.execute(
+        "SELECT * FROM proposals WHERE status = 'pending' ORDER BY created_at, proposal_id"))
+
+
+def decide_proposal(conn, proposal_id: int, approve: bool) -> dict:
+    """Approve (carry out the action) or reject. The status change and the action
+    happen in one transaction: if the action fails (e.g. the session is now
+    locked), neither happens. Returns the updated proposal."""
+    p = conn.execute("SELECT * FROM proposals WHERE proposal_id = ?", (proposal_id,)).fetchone()
+    if p is None:
+        raise ValueError(f"no proposal {proposal_id}")
+    if p["status"] != "pending":
+        raise ValueError(f"proposal {proposal_id} is already {p['status']}")
+    with transaction(conn):
+        if approve:
+            cur = conn.execute(PROPOSAL_ACTIONS[p["action"]], (p["target_id"],))
+            if cur.rowcount != 1:
+                raise ValueError(f"{p['action']}: target {p['target_id']} not found")
+        conn.execute("UPDATE proposals SET status = ?, decided_at = ? WHERE proposal_id = ?",
+                     ("approved" if approve else "rejected", _now(), proposal_id))
+    return dict(conn.execute("SELECT * FROM proposals WHERE proposal_id = ?",
+                             (proposal_id,)).fetchone())
+
+
+def expire_proposals(conn, created_before: str) -> int:
+    """Pending proposals I never answered go stale once the plan they were made
+    for has moved on. Returns how many were expired."""
+    with transaction(conn):
+        cur = conn.execute(
+            "UPDATE proposals SET status = 'expired', decided_at = ? "
+            "WHERE status = 'pending' AND created_at < ?", (_now(), created_before))
+    return cur.rowcount
+
+
+# ---------------------------------------------------------------- weekly priorities
+
+def week_start(day: str | None = None) -> str:
+    """The Monday of the week containing day."""
+    d = date.fromisoformat(_today(day))
+    return date.fromordinal(d.toordinal() - d.weekday()).isoformat()
+
+
+def set_weekly_priorities(conn, priorities: str, day: str | None = None) -> None:
+    """Store my answer for the week containing day. Answering again replaces it."""
+    with transaction(conn):
+        conn.execute(
+            "INSERT INTO weekly_priorities (week_start, priorities, set_at) VALUES (?, ?, ?) "
+            "ON CONFLICT (week_start) DO UPDATE SET priorities = excluded.priorities, "
+            "set_at = excluded.set_at",
+            (week_start(day), priorities, _now()))
+
+
+def get_weekly_priorities(conn, day: str | None = None) -> str | None:
+    row = conn.execute("SELECT priorities FROM weekly_priorities WHERE week_start = ?",
+                       (week_start(day),)).fetchone()
+    return row["priorities"] if row else None
+
+
 # ---------------------------------------------------------------- planner snapshot
 
 def planner_snapshot(conn, today: str | None = None) -> dict:
@@ -342,6 +506,8 @@ def planner_snapshot(conn, today: str | None = None) -> dict:
         "estimate_accuracy": estimate_accuracy(conn),
         "needs_review": stale_low_confidence(conn, today),
         "today_summary": day_summary(conn, today),
+        "weekly_priorities": get_weekly_priorities(conn, today),
+        "pending_proposals": pending_proposals(conn),
     }
 
 
@@ -352,15 +518,34 @@ if __name__ == "__main__":
     import json
 
     p = argparse.ArgumentParser(description="Study coach database")
-    p.add_argument("command", choices=["init", "seed", "snapshot"],
-                   help="init: empty db | seed: db with fake data | snapshot: print planner view")
+    p.add_argument("command",
+                   choices=["init", "seed", "snapshot", "version",
+                            "proposals", "approve", "reject", "priorities"],
+                   help="init: empty db | seed: fake data | snapshot: planner view | "
+                        "version: schema version | proposals: list pending | "
+                        "approve/reject ID | priorities [TEXT]: show or set this week's")
+    p.add_argument("arg", nargs="?", help="proposal id, or priorities text")
     p.add_argument("--db", default=str(DEFAULT_DB))
     p.add_argument("--today", help="YYYY-MM-DD (default: real today)")
     args = p.parse_args()
 
-    conn = connect(args.db)
+    conn = connect(args.db)   # migrates automatically if needed
     if args.command in ("init", "seed"):
         init_db(conn, seed=args.command == "seed")
         print(f"Rebuilt {args.db}" + (" with fake data" if args.command == "seed" else ""))
+    elif args.command == "version":
+        print(f"schema version {schema_version(conn)} (latest {len(MIGRATIONS)})")
+    elif args.command == "proposals":
+        for pr in pending_proposals(conn):
+            print(f"#{pr['proposal_id']}  {pr['action']}({pr['target_id']})  {pr['reason']}")
+    elif args.command in ("approve", "reject"):
+        pr = decide_proposal(conn, int(args.arg), approve=args.command == "approve")
+        print(f"#{pr['proposal_id']} {pr['status']}"
+              + ("  - run `python gcal.py sync`" if pr["action"] == "cancel_session"
+                 and pr["status"] == "approved" else ""))
+    elif args.command == "priorities":
+        if args.arg:
+            set_weekly_priorities(conn, args.arg, args.today)
+        print(get_weekly_priorities(conn, args.today) or "(none set this week)")
     else:
         print(json.dumps(planner_snapshot(conn, args.today), indent=2))

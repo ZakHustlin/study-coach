@@ -7,7 +7,9 @@ and re-plans from what actually got done.
 
 | File | What it is |
 |---|---|
-| `schema.sql` | Table definitions (tracks, items, item_dependencies, sessions, completions) |
+| `schema.sql` | Current table definitions, for building a fresh database |
+| `fixtures/schema_v0.sql` | Frozen old schema, only for testing migrations |
+| `test_migrations.py` | Tests for migrations, proposals, locked sessions, weekly priorities |
 | `seed.sql` | Fake data for testing, with "today" = 2026-09-29 |
 | `queries.sql` | The five analysis queries, each under a `-- name:` header |
 | `db.py` | Data layer - all other code reads/writes the database only through this |
@@ -23,6 +25,10 @@ and re-plans from what actually got done.
 python db.py seed        # rebuild coach.db with fake data
 python db.py init        # rebuild coach.db empty (wipes it!)
 python db.py snapshot    # print what the planner will see, as JSON
+python db.py version     # schema version (coach.db migrates itself on connect)
+python db.py proposals   # pending planner proposals
+python db.py approve 3   # approve proposal #3 (reject 3 to reject)
+python db.py priorities "TMUA paper 2, Greek hw"   # set this week's priorities
 python -m unittest -v    # run the tests
 
 pip install -r requirements.txt
