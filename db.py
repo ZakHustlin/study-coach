@@ -564,6 +564,29 @@ def get_weekly_priorities(conn, day: str | None = None) -> str | None:
     return row["priorities"] if row else None
 
 
+def week_progress(conn, day: str | None = None) -> list[dict]:
+    """Per active track, this week (Mon-Sun): target, minutes logged so far and
+    minutes planned (not cancelled). Lets the planner see who's behind."""
+    start = week_start(day)
+    end = date.fromisoformat(start).toordinal() + 7
+    end = date.fromordinal(end).isoformat()
+    return _rows(conn.execute(
+        """
+        SELECT t.track_id, t.name AS track, t.priority, t.weekly_target_minutes,
+               (SELECT COALESCE(SUM(c.minutes_spent), 0)
+                  FROM completions c JOIN items i ON i.item_id = c.item_id
+                 WHERE i.track_id = t.track_id
+                   AND c.logged_at >= :start AND c.logged_at < :end) AS minutes_logged,
+               (SELECT COALESCE(CAST(ROUND(SUM((julianday(s.end_at) - julianday(s.start_at)) * 1440)) AS INTEGER), 0)
+                  FROM sessions s JOIN items i ON i.item_id = s.item_id
+                 WHERE i.track_id = t.track_id AND s.status = 'planned'
+                   AND s.start_at >= :start AND s.start_at < :end) AS minutes_planned
+        FROM tracks t
+        WHERE t.is_active = 1
+        ORDER BY t.priority DESC, t.track_id
+        """, {"start": start, "end": end}))
+
+
 # ---------------------------------------------------------------- planner snapshot
 
 def planner_snapshot(conn, today: str | None = None) -> dict:

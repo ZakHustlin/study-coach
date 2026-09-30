@@ -1,0 +1,246 @@
+"""The evening re-plan: an LLM agent that plans the rest of the week using tools.py.
+
+How the tool loop works (this is the core of any "agent"):
+
+  1. Send the model: a system prompt (its job + rules), the tool schemas, and a
+     first message holding the current state.
+  2. The model replies. If the reply contains tool calls, run each one with
+     tools.run_tool() and send the results back as the next message.
+  3. Repeat until the model calls finish(), or a safety limit is hit.
+
+The model never runs code or touches the database. It only *asks* for tool calls;
+this file decides whether to run them, and tools.py enforces the rules.
+
+Usage:
+  python planner.py --dry-run      # plan against a COPY of coach.db, change nothing
+  python planner.py                # plan for real, then run `python gcal.py sync`
+  python planner.py --dry-run --now "2026-10-01 21:45"   # pretend it's another time
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sqlite3
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
+from pathlib import Path
+
+import availability
+import db
+import tools
+
+ROOT = Path(__file__).parent
+DEFAULT_MODEL = "claude-haiku-4-5-20251001"
+MAX_STEPS = 25            # model replies per run; stops a confused model looping forever
+MAX_TOKENS = 2000         # per reply
+
+# US$ per million tokens, for the cost estimate. Update if prices change.
+PRICES = {"input": 1.00, "output": 5.00, "cache_write": 1.25, "cache_read": 0.10}
+
+SYSTEM_PROMPT = """\
+You are Zak's study planner. Zak is a UK sixth-form student. Each evening you re-plan \
+the rest of his week (up to the date in `plan_until`) across his study tracks.
+
+How to plan
+- Start from the state in the first message: tracks, weekly targets and progress, \
+this week's priorities (if Zak set any), sessions already planned, free time.
+- Weekly priorities from Zak come first. Then deadlines. Then tracks furthest behind \
+their weekly target, weighted by track priority (5 = most important).
+- Keep what's already planned unless there's a reason to change it. Don't churn the \
+calendar: move a session only if it clearly improves the week.
+- Prefer 45-90 minute sessions. Split items bigger than ~90 minutes across days. \
+Vary tracks within an evening rather than stacking one subject.
+- Low confidence (1-2) on a finished topic, or a note like "didn't get it", is a \
+reason to add a short revision item.
+- Leave slack. Don't fill every free minute; Zak is at school all day.
+- Every session needs a brief: 1-3 concrete sentences saying what to do, e.g. \
+"Do questions 1-10 of the paper under timed conditions, then mark them."
+
+Rules
+- Tools enforce the hard rules (free time, daily cap, gaps, due dates, locked \
+sessions). If a call returns an error, read it and try something else. Don't repeat \
+the same failing call.
+- Never touch locked sessions. To drop work without replacing it, pause a track, or \
+mark an item done, use propose: Zak decides.
+- Finish by calling finish exactly once, with a 2-5 line summary for Zak: what you \
+changed and why. Plain language, no preamble.
+"""
+
+
+# ---------------------------------------------------------------- the first message
+
+def initial_state(ctx: tools.Context) -> dict:
+    """What the model sees before its first tool call. Front-loading this costs a
+    few thousand tokens once, instead of the model spending tool calls to find it."""
+    today = ctx.today.isoformat()
+    until = ctx.horizon_end.isoformat()
+    snap = db.planner_snapshot(ctx.conn, today)
+    return {
+        "now": ctx.now,
+        "weekday": ctx.today.strftime("%A"),
+        "plan_until": until,
+        "weekly_priorities": snap["weekly_priorities"] or "(Zak hasn't set any this week)",
+        "tracks_this_week": db.week_progress(ctx.conn, today),
+        "planned_sessions": tools.get_sessions(ctx, today, until)["sessions"],
+        "free_time": tools.get_free_slots(ctx, today, until)["days"],
+        "available_items": db.available_items(ctx.conn, ctx.now),
+        "completion_rates_14d": snap["completion_rates_14d"],
+        "estimate_accuracy": snap["estimate_accuracy"],
+        "needs_review": snap["needs_review"],
+        "today_log": snap["today_summary"],
+        "pending_proposals": snap["pending_proposals"],
+    }
+
+
+# ---------------------------------------------------------------- the loop
+
+@dataclass
+class RunResult:
+    summary: str
+    changes: list[dict]
+    steps: int
+    usage: dict = field(default_factory=dict)
+    finished: bool = False
+
+    @property
+    def cost_usd(self) -> float:
+        u = self.usage
+        return (u.get("input", 0) * PRICES["input"] + u.get("output", 0) * PRICES["output"]
+                + u.get("cache_write", 0) * PRICES["cache_write"]
+                + u.get("cache_read", 0) * PRICES["cache_read"]) / 1_000_000
+
+
+def _add_usage(total: dict, usage) -> None:
+    total["input"] = total.get("input", 0) + (usage.input_tokens or 0)
+    total["output"] = total.get("output", 0) + (usage.output_tokens or 0)
+    total["cache_write"] = total.get("cache_write", 0) + (getattr(usage, "cache_creation_input_tokens", 0) or 0)
+    total["cache_read"] = total.get("cache_read", 0) + (getattr(usage, "cache_read_input_tokens", 0) or 0)
+
+
+def run(ctx: tools.Context, client, model: str = DEFAULT_MODEL, verbose: bool = False) -> RunResult:
+    # Prompt caching: the system prompt and tool list are identical on every step,
+    # so we mark them cacheable. From step 2 onwards they're read from cache at a
+    # tenth of the normal input price instead of being paid for in full again.
+    system = [{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}]
+    tool_defs = [dict(s) for s in tools.SCHEMAS]
+    tool_defs[-1]["cache_control"] = {"type": "ephemeral"}
+
+    messages = [{"role": "user", "content":
+                 "Current state:\n" + json.dumps(initial_state(ctx), indent=1)}]
+    usage: dict = {}
+    nudged = False
+
+    for step in range(1, MAX_STEPS + 1):
+        response = client.messages.create(model=model, max_tokens=MAX_TOKENS, system=system,
+                                          tools=tool_defs, messages=messages)
+        _add_usage(usage, response.usage)
+        messages.append({"role": "assistant", "content": response.content})
+
+        calls = [b for b in response.content if b.type == "tool_use"]
+        if verbose:
+            for b in response.content:
+                if b.type == "text" and b.text.strip():
+                    print(f"  [{step}] thinks: {b.text.strip()[:200]}")
+
+        if not calls:
+            # The model stopped without calling finish. Remind it once, then give up.
+            if nudged:
+                break
+            nudged = True
+            messages.append({"role": "user", "content": "Call finish with your summary."})
+            continue
+
+        results = []
+        finish = next((c for c in calls if c.name == "finish"), None)
+        for call in calls:
+            if call.name == "finish":
+                continue              # run the real work first, even if finish came first
+            result = tools.run_tool(ctx, call.name, call.input)
+            if verbose:
+                print(f"  [{step}] {call.name}({json.dumps(call.input)[:150]}) -> "
+                      f"{json.dumps(result)[:150]}")
+            results.append({"type": "tool_result", "tool_use_id": call.id,
+                            "content": json.dumps(result), "is_error": "error" in result})
+        if finish is not None:
+            summary = str(finish.input.get("summary", "")).strip()
+            return RunResult(summary, ctx.log, step, usage, finished=True)
+        # Every tool_use must be answered by a tool_result in the very next message.
+        messages.append({"role": "user", "content": results})
+
+    return RunResult("Stopped before finishing (step limit or no finish call). "
+                     "Check the changes list.", ctx.log, step, usage, finished=False)
+
+
+# ---------------------------------------------------------------- setup + CLI
+
+def load_env(path: Path = ROOT / ".env") -> None:
+    """Read KEY=value lines from .env into the environment (doesn't overwrite)."""
+    if path.exists():
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, value = line.split("=", 1)
+                os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+def copy_db(src: Path) -> sqlite3.Connection:
+    """In-memory copy of the database, for dry runs. Uses SQLite's backup API,
+    which copies safely even if another program has the file open."""
+    source = db.connect(src)
+    copy = sqlite3.connect(":memory:")
+    source.backup(copy)
+    source.close()
+    copy.row_factory = sqlite3.Row
+    copy.execute("PRAGMA foreign_keys = ON")
+    return copy
+
+
+def save_log(result: RunResult, now: str, dry_run: bool) -> Path:
+    folder = ROOT / "logs"
+    folder.mkdir(exist_ok=True)
+    path = folder / f"plan-{now.replace(' ', '_').replace(':', '')}{'-dry' if dry_run else ''}.json"
+    path.write_text(json.dumps({
+        "now": now, "dry_run": dry_run, "finished": result.finished, "steps": result.steps,
+        "summary": result.summary, "changes": result.changes, "usage": result.usage,
+        "cost_usd": round(result.cost_usd, 4)}, indent=2))
+    return path
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="Evening re-plan")
+    p.add_argument("--dry-run", action="store_true", help="plan on a copy; change nothing")
+    p.add_argument("--now", help="'YYYY-MM-DD HH:MM' (default: real now)")
+    p.add_argument("--db", default=str(db.DEFAULT_DB))
+    p.add_argument("--model", default=None, help=f"default {DEFAULT_MODEL}")
+    p.add_argument("-q", "--quiet", action="store_true")
+    args = p.parse_args()
+
+    load_env()
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        raise SystemExit("No ANTHROPIC_API_KEY. Add it to .env (see README).")
+    import anthropic                       # imported here so tests don't need it
+    client = anthropic.Anthropic()
+
+    now = args.now or datetime.now().strftime(tools.FMT)
+    conn = copy_db(Path(args.db)) if args.dry_run else db.connect(args.db)
+    if not args.dry_run:
+        # Unanswered proposals from earlier days were about a plan that has moved on.
+        db.expire_proposals(conn, created_before=now[:10])
+
+    ctx = tools.Context(conn, availability.load_config(), now)
+    print(f"Planning {ctx.today} -> {ctx.horizon_end}{' (DRY RUN)' if args.dry_run else ''}")
+    result = run(ctx, client, args.model or os.environ.get("PLANNER_MODEL", DEFAULT_MODEL),
+                 verbose=not args.quiet)
+
+    print("\n" + result.summary)
+    print(f"\n{len(result.changes)} change(s), {result.steps} step(s), "
+          f"{sum(result.usage.values()):,} tokens, ~${result.cost_usd:.3f}")
+    print(f"Log: {save_log(result, now, args.dry_run).relative_to(ROOT)}")
+    if not args.dry_run and result.changes:
+        print("Run `python gcal.py sync` to update your calendar.")
+
+
+if __name__ == "__main__":
+    main()

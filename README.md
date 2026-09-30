@@ -19,6 +19,8 @@ and re-plans from what actually got done.
 | `gcal.py` | Google Calendar: sign-in, the Study (agent) calendar, sync |
 | `tools.py` | The planner's tools: what the LLM can see and do, and the hard rules it can't break |
 | `test_tools.py` | Tests for every planner rule |
+| `planner.py` | The evening re-plan: the LLM tool loop |
+| `test_planner.py` | Loop tests with a scripted fake model (no API key needed) |
 | `test_calendar.py` | Tests for free slots and sync (uses a fake calendar) |
 
 ## Commands
@@ -38,6 +40,10 @@ python gcal.py auth      # one-off Google sign-in
 python gcal.py setup     # one-off: create the Study (agent) calendar
 python gcal.py sync      # push planned/cancelled sessions to Google Calendar
 python gcal.py free      # free slots for the next 7 days
+
+# Planner: needs ANTHROPIC_API_KEY=... in .env
+python planner.py --dry-run   # plan on a copy of coach.db, change nothing
+python planner.py             # plan for real, then: python gcal.py sync
 ```
 
 `coach.db` is gitignored because it holds personal data.
