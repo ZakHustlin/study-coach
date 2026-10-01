@@ -1,0 +1,29 @@
+# The Telegram bot, kept running by systemd.
+# Install: sudo cp deploy/study-coach.service /etc/systemd/system/ && sudo systemctl enable --now study-coach
+[Unit]
+Description=Study coach Telegram bot
+After=network-online.target
+Wants=network-online.target
+# More than 5 crashes in 5 minutes -> stop retrying (see `systemctl status study-coach`)
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=coach
+WorkingDirectory=/home/coach/study-coach
+ExecStart=/home/coach/study-coach/.venv/bin/python bot.py
+# Crash -> restart after 10 s
+Restart=on-failure
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+# Hardening: the bot can write only its own folder and the backups folder.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/coach/study-coach /home/coach/backups
+
+[Install]
+WantedBy=multi-user.target

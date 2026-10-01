@@ -94,3 +94,43 @@ FROM completions c
 JOIN items i ON i.item_id = c.item_id
 WHERE c.session_id IS NULL AND date(c.logged_at) = date(:today)
 ORDER BY time;
+
+-- name: session_patterns
+-- 6. Knowledge base: how planned sessions actually went, by track, weekday/weekend
+--    and time of day, over the last 28 days. This is the "auto-logged" evidence for
+--    the weekly review: it's computed from completions rather than stored twice
+--    (storing it again would be redundant data that could drift out of step).
+SELECT t.track_id, t.name AS track,
+       CASE WHEN strftime('%w', s.start_at) IN ('0', '6') THEN 'weekend' ELSE 'weekday' END AS day_type,
+       CASE WHEN time(s.start_at) < '12:00' THEN 'morning'
+            WHEN time(s.start_at) < '17:00' THEN 'afternoon'
+            WHEN time(s.start_at) < '20:00' THEN 'early evening'
+            ELSE 'late evening' END                                  AS time_of_day,
+       COUNT(*)                                                      AS planned,
+       SUM(CASE WHEN c.outcome = 'done'    THEN 1 ELSE 0 END)        AS done,
+       SUM(CASE WHEN c.outcome = 'partial' THEN 1 ELSE 0 END)        AS partial,
+       SUM(CASE WHEN c.outcome = 'skipped' THEN 1 ELSE 0 END)        AS skipped,
+       SUM(CASE WHEN c.completion_id IS NULL THEN 1 ELSE 0 END)      AS not_logged,
+       ROUND(AVG(c.confidence), 1)                                   AS avg_confidence
+FROM sessions s
+JOIN items i  ON i.item_id = s.item_id
+JOIN tracks t ON t.track_id = i.track_id
+LEFT JOIN completions c ON c.session_id = s.session_id
+WHERE s.status = 'planned'
+  AND date(s.start_at) >  date(:today, '-28 days')
+  AND date(s.start_at) <  date(:today)
+GROUP BY t.track_id, day_type, time_of_day
+ORDER BY t.track_id, day_type, time_of_day;
+
+-- name: weekly_minutes
+-- 7. Minutes logged per track per week (weeks start Monday), last 4 full weeks + this one.
+SELECT t.name AS track,
+       date(c.logged_at, '-' || ((CAST(strftime('%w', c.logged_at) AS INTEGER) + 6) % 7) || ' days') AS week_start,
+       SUM(c.minutes_spent) AS minutes,
+       t.weekly_target_minutes AS target
+FROM completions c
+JOIN items i  ON i.item_id = c.item_id
+JOIN tracks t ON t.track_id = i.track_id
+WHERE date(c.logged_at) > date(:today, '-35 days')
+GROUP BY t.track_id, week_start
+ORDER BY week_start, t.name;

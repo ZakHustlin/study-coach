@@ -25,6 +25,23 @@ and re-plans from what actually got done.
 | `bot.py` | Telegram bot: 22:00 check-in, commands, re-plan + calendar sync |
 | `test_checkin.py` | Check-in tests (no Telegram needed) |
 | `test_calendar.py` | Tests for free slots and sync (uses a fake calendar) |
+| `reviewer.py` | Weekly review: Claude reads the knowledge base and suggests instruction changes |
+| `test_kb.py`, `test_reviewer.py` | Knowledge base, track blocks and review tests |
+| `deploy/` | systemd units, backup timer, server setup and update scripts |
+| `DEPLOY.md` | How to put it on a VPS |
+| `.env.example` | Every setting `.env` can hold |
+
+## Knowledge base
+
+Two loops at two speeds:
+
+- **Nightly planner** (fast): books sessions, follows the instructions: standing
+  rules, track guidance, **track blocks** (hard: "never Greek on weekend mornings",
+  enforced in `tools.py`) and weekly targets.
+- **Weekly review** (slow, Sunday 18:00): Claude reads the evidence (your `/note`s,
+  how sessions actually went by track and time of day, targets vs minutes, its own past
+  suggestions and your answers) and suggests changes to those instructions. Each one
+  arrives in Telegram with Approve / Reject; nothing changes until you approve.
 
 ## Commands
 
@@ -41,6 +58,11 @@ python db.py rule add "No maths on Friday evenings"   # standing instruction to 
 python db.py rule list / rule remove 2
 python db.py add-homework "CS homework 3" 60 2026-10-15
 python db.py add-item "Greek" "Odyssey 16.1-25: translate + notes" 30 --strand odyssey
+python db.py note "too tired for Greek in the mornings"   # evidence for the weekly review
+python db.py notes / kb  # your notes / everything the review reads (paste into Claude)
+python db.py blocks      # hard blocks; block add 2 weekend 09:00-12:00 "reason" / block remove 1
+python db.py changes     # review suggestions; approve-change 3 / reject-change 3
+python db.py backup FILE # safe copy of coach.db while the bot is running
 python -m unittest -v    # run the tests
 
 pip install -r requirements.txt
@@ -55,6 +77,10 @@ python planner.py             # plan for real, then: python gcal.py sync
 
 # Telegram bot: needs TELEGRAM_BOT_TOKEN in .env; send /start from your phone first
 python bot.py                 # keeps running; check-in at 22:00, /help for commands
+
+# Weekly review: ANTHROPIC_API_KEY in .env (or REVIEWER_PROVIDER=deepseek)
+python reviewer.py --dry-run  # review a copy, change nothing
+python reviewer.py            # real run; approve suggestions with /changes
 ```
 
 `coach.db` is gitignored because it holds personal data.

@@ -12,6 +12,8 @@ so the bot never has to remember where you are in the check-in. If it restarts
 halfway through, the buttons on your screen still work. (Same idea as a stateless
 HTTP request carrying all it needs. Telegram limits button data to 64 bytes.)
 
+Button kinds: o/m/c/f = check-in steps, p = planner proposal, k = review suggestion.
+
 Flow per session:  outcome -> minutes -> confidence -> [item finished?] -> logged
   - skipped: logged straight away (0 minutes, no confidence)
   - "item finished?" only when outcome is done and the item isn't open-ended
@@ -120,6 +122,13 @@ def proposal_screens(conn) -> list[Screen]:
     return screens
 
 
+def change_screens(conn) -> list[Screen]:
+    """One screen per instruction change the weekly review suggested."""
+    return [Screen(f"Review suggests: {db.describe_change(conn, ch)}\nWhy: {ch['reason']}",
+                   [[("Approve", f"k:{ch['change_id']}:1"), ("Reject", f"k:{ch['change_id']}:0")]])
+            for ch in db.pending_changes(conn)]
+
+
 def describe_proposal(conn, p: dict) -> str:
     if p["action"] == "cancel_session":
         s = _session(conn, p["target_id"])
@@ -148,6 +157,18 @@ def handle(conn, data: str, day: str | None = None) -> Result:
         verdict = "Approved" if approve else "Rejected"
         return Result(Screen(f"{verdict}: {describe_proposal(conn, p)}"),
                       changed_plan=approve)
+
+    if kind == "k":                                   # instruction change decision
+        cid, approve = int(parts[0]), parts[1] == "1"
+        try:
+            ch = db.decide_change(conn, cid, approve)
+        except Exception as e:                        # already decided, no longer valid
+            return Result(Screen(f"Couldn't do that: {e}"))
+        text = f"{'Approved' if approve else 'Rejected'}: {db.describe_change(conn, ch)}"
+        if ch["sessions_cancelled"]:
+            text += (f"\n{ch['sessions_cancelled']} planned session(s) in that window were "
+                     f"cancelled; tonight's re-plan will rebook them (or /plan now).")
+        return Result(Screen(text), changed_plan=ch["sessions_cancelled"] > 0)
 
     sid = int(parts[0])
     s = _session(conn, sid)

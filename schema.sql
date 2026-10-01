@@ -5,6 +5,10 @@
 PRAGMA foreign_keys = ON;
 
 -- Drop children before parents
+DROP TABLE IF EXISTS instruction_changes;
+DROP TABLE IF EXISTS reviews;
+DROP TABLE IF EXISTS track_blocks;
+DROP TABLE IF EXISTS notes;
 DROP TABLE IF EXISTS rules;
 DROP TABLE IF EXISTS passages;
 DROP TABLE IF EXISTS proposals;
@@ -124,12 +128,66 @@ CREATE TABLE rules (
     active     INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1))  -- removed = 0, kept for history
 );
 
+-- ---------------------------------------------------------------- knowledge base
+-- Things I tell the coach about myself ("too tired for Greek in the mornings").
+-- Raw evidence for the weekly review. The planner never reads these: a note only
+-- changes the plan once the review turns it into a rule/block and I approve it.
+CREATE TABLE notes (
+    note_id     INTEGER PRIMARY KEY,
+    created_at  TEXT    NOT NULL,
+    text        TEXT    NOT NULL,
+    reviewed_at TEXT                               -- NULL until a weekly review has read it
+);
+
+-- Hard rule: never plan this track inside this window on these days.
+-- Enforced in tools.py like the daily cap, so no prompt wording gets past it.
+CREATE TABLE track_blocks (
+    block_id   INTEGER PRIMARY KEY,
+    track_id   INTEGER NOT NULL,
+    days       TEXT    NOT NULL,                   -- 'sat,sun' (mon..sun, comma-separated)
+    start_time TEXT    NOT NULL,                   -- 'HH:MM'
+    end_time   TEXT    NOT NULL,
+    reason     TEXT,
+    created_at TEXT    NOT NULL,
+    active     INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+    CHECK (end_time > start_time),
+    FOREIGN KEY (track_id) REFERENCES tracks(track_id)
+);
+
+-- One row per weekly review run.
+CREATE TABLE reviews (
+    review_id  INTEGER PRIMARY KEY,
+    created_at TEXT    NOT NULL,
+    summary    TEXT    NOT NULL,
+    finished   INTEGER NOT NULL CHECK (finished IN (0, 1)),
+    cost_usd   REAL
+);
+
+-- Changes to the planner's INSTRUCTIONS (rules, guidance, blocks, targets) that a
+-- review suggests. Kept apart from `proposals`, which change the PLAN: payloads vary
+-- by action, so here it's JSON, validated in db.py before insert and again on approve.
+CREATE TABLE instruction_changes (
+    change_id  INTEGER PRIMARY KEY,
+    review_id  INTEGER,
+    created_at TEXT    NOT NULL,
+    action     TEXT    NOT NULL CHECK (action IN ('add_rule', 'remove_rule', 'set_guidance',
+                                                  'add_block', 'remove_block', 'set_weekly_target')),
+    payload    TEXT    NOT NULL,                   -- canonical JSON (sorted keys)
+    reason     TEXT    NOT NULL,                   -- the evidence, shown to me
+    status     TEXT    NOT NULL DEFAULT 'pending'
+               CHECK (status IN ('pending', 'approved', 'rejected', 'expired')),
+    decided_at TEXT,
+    FOREIGN KEY (review_id) REFERENCES reviews(review_id)
+);
+
 CREATE INDEX idx_items_track        ON items(track_id);
 CREATE INDEX idx_sessions_start     ON sessions(start_at);
 CREATE INDEX idx_completions_item   ON completions(item_id, logged_at);
 -- Stops the nightly planner piling up the same proposal every evening
 CREATE UNIQUE INDEX idx_proposals_one_pending
     ON proposals(action, target_id) WHERE status = 'pending';
+CREATE UNIQUE INDEX idx_changes_one_pending
+    ON instruction_changes(action, payload) WHERE status = 'pending';
 
 -- Defence in depth: the planner's tools already refuse locked sessions, but this
 -- makes the database itself refuse to move, re-item or cancel one. To change a
@@ -143,4 +201,4 @@ BEGIN
 END;
 
 -- Schema version: must equal len(db.MIGRATIONS). Bump both together.
-PRAGMA user_version = 4;
+PRAGMA user_version = 5;
