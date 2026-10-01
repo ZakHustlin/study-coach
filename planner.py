@@ -69,6 +69,8 @@ this week's priorities (if Zak set any), sessions already planned, free time.
 override everything below except the hard rules the tools enforce. If a rule makes \
 something impossible (e.g. a homework can't fit), plan the best you can and say so \
 in the summary.
+- `track_blocks` are times a track must never go in (e.g. no Greek on weekend \
+mornings). The tools refuse them, so plan around them from the start.
 - Each track's `guidance` is Zak's instructions for that track. Follow it: it \
 overrides the general rules below (e.g. "every day, 30 min" means spread, not batch).
 - Weekly priorities from Zak come first. Then deadlines. Then tracks furthest behind \
@@ -128,6 +130,8 @@ def initial_state(ctx: tools.Context) -> dict:
         "weekday": ctx.today.strftime("%A"),
         "plan_until": until,
         "standing_rules": [r["text"] for r in db.list_rules(ctx.conn)],
+        "track_blocks": [{k: b[k] for k in ("track", "days", "start_time", "end_time", "reason")}
+                         for b in db.list_blocks(ctx.conn)],
         "weekly_priorities": snap["weekly_priorities"] or "(Zak hasn't set any this week)",
         "tracks_this_week": db.week_progress(ctx.conn, today, ctx.now),
         "strand_balance_14d": db.strand_balance(ctx.conn, today),

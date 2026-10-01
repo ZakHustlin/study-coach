@@ -106,6 +106,60 @@ MIGRATIONS: list[str] = [
         active     INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1))  -- removed = 0, kept for history
     );
     """,
+    # 5: knowledge base - my notes, hard per-track time blocks, weekly reviews and
+    #    the instruction changes they suggest
+    """
+    CREATE TABLE notes (
+        note_id     INTEGER PRIMARY KEY,
+        created_at  TEXT    NOT NULL,
+        text        TEXT    NOT NULL,
+        reviewed_at TEXT                               -- NULL until a weekly review has read it
+    );
+
+    -- Hard rule: never plan this track inside this window on these days.
+    -- Enforced in tools.py like the daily cap, so no prompt wording gets past it.
+    CREATE TABLE track_blocks (
+        block_id   INTEGER PRIMARY KEY,
+        track_id   INTEGER NOT NULL,
+        days       TEXT    NOT NULL,                   -- 'sat,sun' (mon..sun, comma-separated)
+        start_time TEXT    NOT NULL,                   -- 'HH:MM'
+        end_time   TEXT    NOT NULL,
+        reason     TEXT,
+        created_at TEXT    NOT NULL,
+        active     INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+        CHECK (end_time > start_time),
+        FOREIGN KEY (track_id) REFERENCES tracks(track_id)
+    );
+
+    -- One row per weekly review run.
+    CREATE TABLE reviews (
+        review_id  INTEGER PRIMARY KEY,
+        created_at TEXT    NOT NULL,
+        summary    TEXT    NOT NULL,
+        finished   INTEGER NOT NULL CHECK (finished IN (0, 1)),
+        cost_usd   REAL
+    );
+
+    -- Changes to the planner's INSTRUCTIONS (rules, guidance, blocks, targets) that a
+    -- review suggests. Kept apart from `proposals`, which change the PLAN: payloads vary
+    -- by action, so here it's JSON, validated in db.py before insert and again on approve.
+    CREATE TABLE instruction_changes (
+        change_id  INTEGER PRIMARY KEY,
+        review_id  INTEGER,
+        created_at TEXT    NOT NULL,
+        action     TEXT    NOT NULL CHECK (action IN ('add_rule', 'remove_rule', 'set_guidance',
+                                                      'add_block', 'remove_block', 'set_weekly_target')),
+        payload    TEXT    NOT NULL,                   -- canonical JSON (sorted keys)
+        reason     TEXT    NOT NULL,                   -- the evidence, shown to me
+        status     TEXT    NOT NULL DEFAULT 'pending'
+                   CHECK (status IN ('pending', 'approved', 'rejected', 'expired')),
+        decided_at TEXT,
+        FOREIGN KEY (review_id) REFERENCES reviews(review_id)
+    );
+
+    CREATE UNIQUE INDEX idx_changes_one_pending
+        ON instruction_changes(action, payload) WHERE status = 'pending';
+    """,
 ]
 
 
@@ -732,6 +786,383 @@ def load_sql(conn, path: str | Path) -> None:
     conn.execute("PRAGMA foreign_keys = ON")
 
 
+# ---------------------------------------------------------------- knowledge base
+#
+# Three layers, each with a different owner:
+#   evidence     notes (I write them), completions/session_patterns (logged automatically)
+#   analysis     reviews: the weekly Claude review reads the evidence...
+#   instructions ...and suggests instruction_changes to rules / guidance / track_blocks /
+#                targets. Nothing changes until I approve. The planner only ever reads
+#                the instructions layer.
+
+DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+DAY_GROUPS = {"weekdays": DAYS[:5], "weekend": DAYS[5:], "all": DAYS}
+
+
+def add_note(conn, text: str, now: str | None = None) -> int:
+    if not text or not text.strip():
+        raise ValueError("note is empty")
+    with transaction(conn):
+        cur = conn.execute("INSERT INTO notes (created_at, text) VALUES (?, ?)",
+                           (now or _now(), text.strip()))
+    return cur.lastrowid
+
+
+def list_notes(conn, unreviewed_only: bool = False, limit: int = 50) -> list[dict]:
+    sql = "SELECT * FROM notes" + (" WHERE reviewed_at IS NULL" if unreviewed_only else "")
+    rows = _rows(conn.execute(sql + " ORDER BY note_id DESC LIMIT ?", (limit,)))
+    return rows[::-1]                              # oldest first, newest last
+
+
+def mark_notes_reviewed(conn, up_to_note_id: int, now: str | None = None) -> int:
+    """Only notes the review actually saw: one sent mid-review stays unreviewed."""
+    with transaction(conn):
+        cur = conn.execute("UPDATE notes SET reviewed_at = ? "
+                           "WHERE reviewed_at IS NULL AND note_id <= ?",
+                           (now or _now(), up_to_note_id))
+    return cur.rowcount
+
+
+def parse_days(days) -> list[str]:
+    """'sat,sun' / ['sat', 'sun'] / 'weekend' -> ['sat', 'sun'], in week order."""
+    if isinstance(days, str):
+        days = [d.strip() for d in days.split(",")]
+    out: set[str] = set()
+    for d in days or []:
+        d = str(d).strip().lower()
+        if d in DAY_GROUPS:
+            out.update(DAY_GROUPS[d])
+        elif d[:3] in DAYS:                        # 'saturday' -> 'sat'
+            out.add(d[:3])
+        else:
+            raise ValueError(f"unknown day {d!r}: use mon..sun, weekdays, weekend or all")
+    if not out:
+        raise ValueError("days is empty")
+    return [d for d in DAYS if d in out]
+
+
+def _hhmm(s: str, what: str) -> str:
+    try:
+        return datetime.strptime(str(s).strip(), "%H:%M").strftime("%H:%M")
+    except ValueError:
+        raise ValueError(f"{what} must be HH:MM, got {s!r}")
+
+
+def add_block(conn, track_id: int, days, start: str, end: str,
+              reason: str | None = None) -> int:
+    days_s = ",".join(parse_days(days))
+    start, end = _hhmm(start, "start"), _hhmm(end, "end")
+    if end <= start:
+        raise ValueError("end must be after start")
+    if not conn.execute("SELECT 1 FROM tracks WHERE track_id = ?", (track_id,)).fetchone():
+        raise ValueError(f"no track {track_id}")
+    with transaction(conn):
+        cur = conn.execute(
+            "INSERT INTO track_blocks (track_id, days, start_time, end_time, reason, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)", (track_id, days_s, start, end, reason, _now()))
+    return cur.lastrowid
+
+
+def list_blocks(conn, track_id: int | None = None) -> list[dict]:
+    sql = ("SELECT b.*, t.name AS track FROM track_blocks b "
+           "JOIN tracks t ON t.track_id = b.track_id WHERE b.active = 1")
+    params: tuple = ()
+    if track_id is not None:
+        sql += " AND b.track_id = ?"
+        params = (track_id,)
+    return _rows(conn.execute(sql + " ORDER BY b.track_id, b.start_time", params))
+
+
+def blocks_on(conn, track_id: int, day: date) -> list[dict]:
+    """Active blocks for a track that apply on this date."""
+    name = DAYS[day.weekday()]
+    return [b for b in list_blocks(conn, track_id) if name in b["days"].split(",")]
+
+
+def remove_block(conn, block_id: int) -> None:
+    with transaction(conn):
+        if conn.execute("UPDATE track_blocks SET active = 0 WHERE block_id = ? AND active = 1",
+                        (block_id,)).rowcount != 1:
+            raise ValueError(f"no active block {block_id}")
+
+
+def _cancel_sessions_in_block(conn, track_id: int, days: list[str], start: str, end: str,
+                              now: str | None = None) -> int:
+    """Future unlocked sessions of a track that fall in a newly approved block are
+    cancelled, so the next re-plan rebooks them elsewhere. Locked ones are mine: kept.
+    Runs inside the caller's transaction."""
+    rows = conn.execute(
+        """SELECT s.session_id, s.start_at, s.end_at FROM sessions s
+           JOIN items i ON i.item_id = s.item_id
+           WHERE i.track_id = ? AND s.status = 'planned' AND s.locked = 0 AND s.start_at >= ?""",
+        (track_id, now or _now())).fetchall()
+    n = 0
+    for r in rows:
+        day = DAYS[datetime.strptime(r["start_at"], "%Y-%m-%d %H:%M").weekday()]
+        if day in days and r["start_at"][11:] < end and r["end_at"][11:] > start:
+            conn.execute("UPDATE sessions SET status = 'cancelled' WHERE session_id = ?",
+                         (r["session_id"],))
+            n += 1
+    return n
+
+
+# What each instruction change needs. validate_change() checks a payload against the
+# live database, so a bad suggestion is refused before it reaches me.
+CHANGE_ACTIONS = ("add_rule", "remove_rule", "set_guidance", "add_block", "remove_block",
+                  "set_weekly_target")
+
+
+def _track(conn, track_id) -> dict:
+    row = conn.execute("SELECT * FROM tracks WHERE track_id = ?", (track_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"no track {track_id}")
+    return dict(row)
+
+
+def validate_change(conn, action: str, payload: dict) -> dict:
+    """Return the cleaned payload (only the fields that action uses) or raise ValueError."""
+    if action not in CHANGE_ACTIONS:
+        raise ValueError(f"action must be one of {', '.join(CHANGE_ACTIONS)}")
+    p = payload or {}
+
+    def need(key):
+        if p.get(key) in (None, "", []):
+            raise ValueError(f"{action} needs {key!r}")
+        return p[key]
+
+    def as_int(key):
+        try:
+            return int(need(key))
+        except (TypeError, ValueError):
+            raise ValueError(f"{key} must be a whole number")
+
+    if action == "add_rule":
+        text = str(need("text")).strip()
+        if len(text) > 300:
+            raise ValueError("rule text is over 300 characters: make it one clear instruction")
+        return {"text": text}
+    if action == "remove_rule":
+        rid = as_int("rule_id")
+        if not conn.execute("SELECT 1 FROM rules WHERE rule_id = ? AND active = 1", (rid,)).fetchone():
+            raise ValueError(f"no active rule {rid}")
+        return {"rule_id": rid}
+    if action == "set_guidance":
+        tid = as_int("track_id")
+        _track(conn, tid)
+        guidance = str(need("guidance")).strip()
+        if len(guidance) > 1500:
+            raise ValueError("guidance is over 1500 characters")
+        return {"track_id": tid, "guidance": guidance}
+    if action == "add_block":
+        tid = as_int("track_id")
+        _track(conn, tid)
+        start, end = _hhmm(need("start"), "start"), _hhmm(need("end"), "end")
+        if end <= start:
+            raise ValueError("end must be after start")
+        return {"track_id": tid, "days": parse_days(need("days")), "start": start, "end": end}
+    if action == "remove_block":
+        bid = as_int("block_id")
+        if not conn.execute("SELECT 1 FROM track_blocks WHERE block_id = ? AND active = 1",
+                            (bid,)).fetchone():
+            raise ValueError(f"no active block {bid}")
+        return {"block_id": bid}
+    # set_weekly_target
+    tid = as_int("track_id")
+    _track(conn, tid)
+    minutes = as_int("minutes")
+    if not 0 <= minutes <= 1200:
+        raise ValueError("minutes must be 0-1200 a week")
+    return {"track_id": tid, "minutes": minutes}
+
+
+def _canonical(payload: dict) -> str:
+    """Same payload -> same text, so the unique index catches duplicates."""
+    import json
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def create_change(conn, action: str, payload: dict, reason: str,
+                  review_id: int | None = None) -> int:
+    """Raises ValueError (bad payload) or sqlite3.IntegrityError (same one pending)."""
+    if not reason or not reason.strip():
+        raise ValueError("reason is required: Zak decides based on it")
+    clean = validate_change(conn, action, payload)
+    with transaction(conn):
+        cur = conn.execute(
+            "INSERT INTO instruction_changes (review_id, created_at, action, payload, reason) "
+            "VALUES (?, ?, ?, ?, ?)", (review_id, _now(), action, _canonical(clean), reason.strip()))
+    return cur.lastrowid
+
+
+def _change_row(row) -> dict:
+    import json
+    d = dict(row)
+    d["payload"] = json.loads(d["payload"])
+    return d
+
+
+def get_change(conn, change_id: int) -> dict | None:
+    row = conn.execute("SELECT * FROM instruction_changes WHERE change_id = ?",
+                       (change_id,)).fetchone()
+    return _change_row(row) if row else None
+
+
+def pending_changes(conn) -> list[dict]:
+    return [_change_row(r) for r in conn.execute(
+        "SELECT * FROM instruction_changes WHERE status = 'pending' ORDER BY change_id")]
+
+
+def recent_changes(conn, limit: int = 20) -> list[dict]:
+    """Decided changes, newest first: rejections tell the next review what NOT to suggest."""
+    return [_change_row(r) for r in conn.execute(
+        "SELECT * FROM instruction_changes WHERE status IN ('approved', 'rejected') "
+        "ORDER BY decided_at DESC, change_id DESC LIMIT ?", (limit,))]
+
+
+def expire_changes(conn) -> int:
+    """A new review re-reads everything, so the last review's unanswered suggestions go."""
+    with transaction(conn):
+        cur = conn.execute("UPDATE instruction_changes SET status = 'expired', decided_at = ? "
+                           "WHERE status = 'pending'", (_now(),))
+    return cur.rowcount
+
+
+def decide_change(conn, change_id: int, approve: bool) -> dict:
+    """Approve (apply it) or reject. Re-validates first, because the database may have
+    changed since the review (e.g. I removed that rule by hand). Apply + status change
+    are one transaction. Returns the change plus 'sessions_cancelled'."""
+    ch = get_change(conn, change_id)
+    if ch is None:
+        raise ValueError(f"no instruction change {change_id}")
+    if ch["status"] != "pending":
+        raise ValueError(f"change {change_id} is already {ch['status']}")
+    cancelled = 0
+    if approve:
+        p = validate_change(conn, ch["action"], ch["payload"])
+    with transaction(conn):
+        if approve:
+            a = ch["action"]
+            if a == "add_rule":
+                conn.execute("INSERT INTO rules (text, created_at) VALUES (?, ?)", (p["text"], _now()))
+            elif a == "remove_rule":
+                conn.execute("UPDATE rules SET active = 0 WHERE rule_id = ?", (p["rule_id"],))
+            elif a == "set_guidance":
+                conn.execute("UPDATE tracks SET guidance = ? WHERE track_id = ?",
+                             (p["guidance"], p["track_id"]))
+            elif a == "add_block":
+                conn.execute(
+                    "INSERT INTO track_blocks (track_id, days, start_time, end_time, reason, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (p["track_id"], ",".join(p["days"]), p["start"], p["end"], ch["reason"], _now()))
+                cancelled = _cancel_sessions_in_block(conn, p["track_id"], p["days"], p["start"], p["end"])
+            elif a == "remove_block":
+                conn.execute("UPDATE track_blocks SET active = 0 WHERE block_id = ?", (p["block_id"],))
+            elif a == "set_weekly_target":
+                conn.execute("UPDATE tracks SET weekly_target_minutes = ? WHERE track_id = ?",
+                             (p["minutes"], p["track_id"]))
+        conn.execute("UPDATE instruction_changes SET status = ?, decided_at = ? WHERE change_id = ?",
+                     ("approved" if approve else "rejected", _now(), change_id))
+    out = get_change(conn, change_id)
+    out["sessions_cancelled"] = cancelled
+    return out
+
+
+def describe_change(conn, ch: dict) -> str:
+    """One line a human can say yes or no to."""
+    p, a = ch["payload"], ch["action"]
+
+    def track_name(tid):
+        row = conn.execute("SELECT name FROM tracks WHERE track_id = ?", (tid,)).fetchone()
+        return row["name"] if row else f"track {tid}"
+
+    if a == "add_rule":
+        return f'add rule: "{p["text"]}"'
+    if a == "remove_rule":
+        row = conn.execute("SELECT text FROM rules WHERE rule_id = ?", (p["rule_id"],)).fetchone()
+        return f'remove rule {p["rule_id"]}' + (f': "{row["text"]}"' if row else "")
+    if a == "set_guidance":
+        return f'new guidance for {track_name(p["track_id"])}: "{p["guidance"]}"'
+    if a == "add_block":
+        return (f'never plan {track_name(p["track_id"])} {p["start"]}-{p["end"]} on '
+                f'{", ".join(p["days"])}')
+    if a == "remove_block":
+        row = conn.execute("SELECT b.*, t.name FROM track_blocks b JOIN tracks t "
+                           "ON t.track_id = b.track_id WHERE block_id = ?", (p["block_id"],)).fetchone()
+        return (f'lift block {p["block_id"]}' + (f' ({row["name"]} {row["start_time"]}-'
+                f'{row["end_time"]} on {row["days"]})' if row else ""))
+    return f'set {track_name(p["track_id"])} weekly target to {p["minutes"]} min'
+
+
+def save_review(conn, summary: str, finished: bool, cost_usd: float | None = None,
+                now: str | None = None) -> int:
+    with transaction(conn):
+        cur = conn.execute("INSERT INTO reviews (created_at, summary, finished, cost_usd) "
+                           "VALUES (?, ?, ?, ?)", (now or _now(), summary, int(finished), cost_usd))
+    return cur.lastrowid
+
+
+def last_review(conn) -> dict | None:
+    row = conn.execute("SELECT * FROM reviews WHERE finished = 1 "
+                       "ORDER BY review_id DESC LIMIT 1").fetchone()
+    return dict(row) if row else None
+
+
+def session_patterns(conn, today: str | None = None) -> list[dict]:
+    return _rows(conn.execute(QUERIES["session_patterns"], {"today": _today(today)}))
+
+
+def weekly_minutes(conn, today: str | None = None) -> list[dict]:
+    return _rows(conn.execute(QUERIES["weekly_minutes"], {"today": _today(today)}))
+
+
+def kb_snapshot(conn, today: str | None = None) -> dict:
+    """Everything the weekly review reads. Also `python db.py kb`, to paste into Claude
+    for a deeper review by hand."""
+    today = _today(today)
+    prev = last_review(conn)
+    return {
+        "today": today,
+        "current_instructions": {
+            "tracks": [{k: t[k] for k in ("track_id", "name", "priority", "weekly_target_minutes",
+                                          "end_date", "is_active", "guidance")}
+                       for t in list_tracks(conn, active_only=False)],
+            "standing_rules": [{"rule_id": r["rule_id"], "text": r["text"]} for r in list_rules(conn)],
+            "track_blocks": [{k: b[k] for k in ("block_id", "track_id", "track", "days",
+                                                "start_time", "end_time", "reason")}
+                             for b in list_blocks(conn)],
+            "weekly_priorities": get_weekly_priorities(conn, today),
+        },
+        "new_notes": [{k: n[k] for k in ("note_id", "created_at", "text")}
+                      for n in list_notes(conn, unreviewed_only=True)],
+        "older_notes": [{k: n[k] for k in ("note_id", "created_at", "text")}
+                        for n in list_notes(conn, limit=80) if n["reviewed_at"]][-30:],
+        "session_patterns_28d": session_patterns(conn, today),
+        "weekly_minutes": weekly_minutes(conn, today),
+        "completion_rates_14d": completion_rates(conn, today),
+        "estimate_accuracy": estimate_accuracy(conn),
+        "low_confidence_stale": stale_low_confidence(conn, today),
+        "completion_notes_28d": _rows(conn.execute(
+            "SELECT c.logged_at, t.name AS track, i.title, c.outcome, c.confidence, c.note "
+            "FROM completions c JOIN items i ON i.item_id = c.item_id "
+            "JOIN tracks t ON t.track_id = i.track_id "
+            "WHERE c.note IS NOT NULL AND date(c.logged_at) > date(?, '-28 days') "
+            "ORDER BY c.logged_at", (today,))),
+        "last_review": {"created_at": prev["created_at"], "summary": prev["summary"]} if prev else None,
+        "past_decisions": [{"action": c["action"], "payload": c["payload"], "reason": c["reason"],
+                            "status": c["status"]} for c in recent_changes(conn)],
+    }
+
+
+def backup(conn, dest: str | Path) -> None:
+    """Consistent copy of the live database via SQLite's online backup API: safe while
+    the bot is writing (copying the file with cp could catch it mid-write)."""
+    out = sqlite3.connect(dest)
+    try:
+        conn.backup(out)
+    finally:
+        out.close()
+
+
 # ---------------------------------------------------------------- planner snapshot
 
 def planner_snapshot(conn, today: str | None = None) -> dict:
@@ -762,12 +1193,18 @@ if __name__ == "__main__":
                             "proposals", "approve", "reject", "priorities",
                             "load", "cancel-future", "guidance",
                             "add-homework", "add-item", "items",
-                            "passages", "covered", "rule"],
+                            "passages", "covered", "rule",
+                            "note", "notes", "kb", "blocks", "block", "changes",
+                            "approve-change", "reject-change", "backup"],
                    help="init: empty db | seed: fake data | snapshot: planner view | "
                         "version: schema version | proposals: list pending | "
                         "approve/reject ID | priorities [TEXT]: show or set this week's | "
                         "load FILE: run a SQL file | cancel-future: cancel all future "
-                        "sessions | guidance TRACK_ID TEXT: set a track's planner notes")
+                        "sessions | guidance TRACK_ID TEXT: set a track's planner notes | "
+                        "note TEXT / notes: knowledge-base notes | kb: what the weekly "
+                        "review reads | blocks / block add|remove: hard track blocks | "
+                        "changes, approve-change/reject-change ID: review suggestions | "
+                        "backup FILE: safe copy of the database")
     p.add_argument("arg", nargs="?", help="proposal id, priorities text, file or track id")
     p.add_argument("text", nargs="?", help="guidance text / item title")
     p.add_argument("extra", nargs="*", help="add-homework: MINUTES DUE_DATE | add-item: MINUTES")
@@ -857,6 +1294,50 @@ if __name__ == "__main__":
         for it in available_items(conn):
             print(f"{it['item_id']:>4}  {it['track']:<22} {(it['strand'] or ''):<10} "
                   f"{it['title']}" + (f"  (due {it['due_date']})" if it["due_date"] else ""))
+    elif args.command == "note":
+        print(f"Note {add_note(conn, args.arg)} saved for the weekly review.")
+    elif args.command == "notes":
+        for n in list_notes(conn, limit=30):
+            print(f"{n['note_id']:>4}  {n['created_at']}  {'  ' if n['reviewed_at'] else '* '}{n['text']}")
+        print("(* = not reviewed yet)")
+    elif args.command == "kb":
+        print(json.dumps(kb_snapshot(conn, args.today), indent=1))
+    elif args.command == "block":
+        # block add TRACK_ID DAYS HH:MM-HH:MM ["reason"] | block remove ID
+        try:
+            if args.arg == "add" and args.text and len(args.extra) >= 2:
+                start, end = args.extra[1].split("-")
+                bid = add_block(conn, int(args.text), args.extra[0], start, end,
+                                " ".join(args.extra[2:]) or None)
+                print(f"Block {bid} added. Applies from the next re-plan.")
+            elif args.arg == "remove" and args.text:
+                remove_block(conn, int(args.text))
+                print(f"Block {args.text} lifted.")
+            else:
+                raise SystemExit('usage: block add TRACK_ID sat,sun 09:00-12:00 "reason" | block remove ID')
+        except ValueError as e:
+            raise SystemExit(str(e))
+    elif args.command == "blocks":
+        for b in list_blocks(conn):
+            print(f"{b['block_id']:>3}  {b['track']:<22} {b['days']:<28} "
+                  f"{b['start_time']}-{b['end_time']}  {b['reason'] or ''}")
+        if not list_blocks(conn):
+            print("(no blocks)")
+    elif args.command == "changes":
+        for ch in pending_changes(conn):
+            print(f"#{ch['change_id']}  {describe_change(conn, ch)}\n     why: {ch['reason']}")
+        if not pending_changes(conn):
+            print("(no suggestions waiting)")
+    elif args.command in ("approve-change", "reject-change"):
+        ch = decide_change(conn, int(args.arg), approve=args.command == "approve-change")
+        print(f"#{ch['change_id']} {ch['status']}: {describe_change(conn, ch)}"
+              + (f"\n{ch['sessions_cancelled']} session(s) in that window cancelled: "
+                 f"run `python gcal.py sync`" if ch["sessions_cancelled"] else ""))
+    elif args.command == "backup":
+        if not args.arg:
+            raise SystemExit("usage: backup FILE")
+        backup(conn, args.arg)
+        print(f"Backed up {args.db} -> {args.arg}")
     elif args.command == "guidance":
         set_track_guidance(conn, int(args.arg), args.text)
         print(f"Track {args.arg}: {args.text}")

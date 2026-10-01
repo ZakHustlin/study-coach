@@ -6,8 +6,11 @@ What it does
 - 22:00 every day: the check-in. One message per session, answered with buttons
   (see checkin.py). When the last one is logged it re-plans and syncs the calendar.
 - 23:00 fallback: if you never finished the check-in, it re-plans anyway.
+- Sunday 18:00: the weekly review (reviewer.py). Claude reads the knowledge base
+  (your /notes + how sessions actually went) and sends suggested instruction
+  changes with Approve / Reject buttons, before the Sunday re-plan uses them.
 - Commands: /checkin /today /plan /proposals /rule /rules /unrule /homework
-  /covered /help
+  /covered /note /notes /review /changes /blocks /help
 
 Key decisions
 - Long polling: the bot keeps asking Telegram "anything new?" instead of Telegram
@@ -40,18 +43,22 @@ import availability
 import checkin
 import db
 import planner
+import reviewer
 
 ROOT = Path(__file__).parent
 STATE = ROOT / "bot_state.json"
 TZ = ZoneInfo("Europe/London")
 CHECKIN_AT = dtime(22, 0, tzinfo=TZ)
 FALLBACK_REPLAN_AT = dtime(23, 0, tzinfo=TZ)
+REVIEW_AT = dtime(18, 0, tzinfo=TZ)
+REVIEW_DAYS = (0,)            # python-telegram-bot counts 0 = Sunday (not Monday!)
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)   # don't log every poll (or the token in URLs)
 log = logging.getLogger("bot")
 
 _replan_lock = asyncio.Lock()
+_review_lock = asyncio.Lock()
 
 
 # ---------------------------------------------------------------- state + helpers
@@ -147,6 +154,34 @@ async def run_replan(context) -> None:
         conn.close()
 
 
+def review_now() -> str:
+    conn = db.connect()
+    try:
+        now = db.local_now().strftime("%Y-%m-%d %H:%M")
+        result = reviewer.review(conn, reviewer.setup_llm(), now)
+        n = len(result.change_ids)
+        return (f"Weekly review\n\n{result.summary}\n\n"
+                + (f"{n} suggestion(s) below." if n else "No changes suggested.")
+                + f" (~${result.cost_usd:.3f})")
+    except planner.PlannerError as e:
+        return f"Weekly review failed: {e}"
+    finally:
+        conn.close()
+
+
+async def run_review(context) -> None:
+    if _review_lock.locked():
+        await context.bot.send_message(owner_id(), "A review is already running.")
+        return
+    async with _review_lock:
+        await context.bot.send_message(owner_id(), "Reviewing the knowledge base...")
+        await context.bot.send_message(owner_id(), await asyncio.to_thread(review_now))
+        conn = db.connect()
+        for screen in checkin.change_screens(conn):
+            await send(context, screen)
+        conn.close()
+
+
 # ---------------------------------------------------------------- scheduled jobs
 
 async def checkin_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -167,6 +202,11 @@ async def fallback_replan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     if owner_id() is not None and load_state().get("last_replan") != today():
         await context.bot.send_message(owner_id(), "Check-in wasn't finished; re-planning with what's logged.")
         await run_replan(context)
+
+
+async def review_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    if owner_id() is not None:
+        await run_review(context)
 
 
 # ---------------------------------------------------------------- commands
@@ -193,7 +233,10 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/homework TITLE MINUTES YYYY-MM-DD: add homework\n"
         "/covered: mark set-text passages done in class\n"
         "/rule TEXT: standing instruction to the planner\n"
-        "/rules: list rules   /unrule N: remove one")
+        "/rules: list rules   /unrule N: remove one\n"
+        "/note TEXT: tell the coach something about you (read by the Sunday review)\n"
+        "/notes: recent notes   /review: run the review now\n"
+        "/changes: review suggestions waiting   /blocks: times a track is never planned")
 
 
 @owner_only
@@ -298,6 +341,57 @@ async def unrule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 @owner_only
+async def note_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = " ".join(context.args)
+    if not text:
+        await update.message.reply_text("Usage: /note too tired for Greek in the mornings")
+        return
+    conn = db.connect()
+    nid = db.add_note(conn, text)
+    conn.close()
+    await update.message.reply_text(
+        f"Noted ({nid}). The Sunday review will weigh it up and suggest changes for you to "
+        f"approve. If it can't wait: /rule for a soft instruction now.")
+
+
+@owner_only
+async def notes_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    conn = db.connect()
+    notes = db.list_notes(conn, limit=10)
+    conn.close()
+    await update.message.reply_text(
+        "\n".join(f"{n['created_at'][:10]}{'' if n['reviewed_at'] else ' •'} {n['text']}"
+                  for n in notes) + "\n\n• = not reviewed yet" if notes else "No notes yet. /note TEXT")
+
+
+@owner_only
+async def review_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await run_review(context)
+
+
+@owner_only
+async def changes_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    conn = db.connect()
+    screens = checkin.change_screens(conn)
+    conn.close()
+    if not screens:
+        await update.message.reply_text("No review suggestions waiting.")
+    for screen in screens:
+        await send(context, screen)
+
+
+@owner_only
+async def blocks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    conn = db.connect()
+    blocks = db.list_blocks(conn)
+    conn.close()
+    await update.message.reply_text(
+        "\n".join(f"{b['block_id']}. {b['track']}: never {b['start_time']}-{b['end_time']} "
+                  f"on {b['days']}" + (f" ({b['reason']})" if b["reason"] else "") for b in blocks)
+        or "No blocks. The weekly review suggests them from your notes and skips.")
+
+
+@owner_only
 async def covered_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Buttons for the next few uncovered passages of each text."""
     conn = db.connect()
@@ -360,12 +454,15 @@ def main() -> None:
     for name, fn in [("start", start), ("help", help_cmd), ("checkin", checkin_cmd),
                      ("today", today_cmd), ("plan", plan_cmd), ("proposals", proposals_cmd),
                      ("homework", homework_cmd), ("rule", rule_cmd), ("rules", rules_cmd),
-                     ("unrule", unrule_cmd), ("covered", covered_cmd)]:
+                     ("unrule", unrule_cmd), ("covered", covered_cmd),
+                     ("note", note_cmd), ("notes", notes_cmd), ("review", review_cmd),
+                     ("changes", changes_cmd), ("blocks", blocks_cmd)]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CallbackQueryHandler(on_button))
 
     app.job_queue.run_daily(checkin_job, CHECKIN_AT, name="checkin")
     app.job_queue.run_daily(fallback_replan_job, FALLBACK_REPLAN_AT, name="fallback")
+    app.job_queue.run_daily(review_job, REVIEW_AT, days=REVIEW_DAYS, name="review")
 
     log.info("Bot running. Owner chat: %s. Check-in at %s.", owner_id() or "(send /start)", CHECKIN_AT)
     app.run_polling()

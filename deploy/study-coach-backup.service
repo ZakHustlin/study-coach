@@ -1,0 +1,14 @@
+# One database backup. Started by study-coach-backup.timer, or by hand:
+#   sudo systemctl start study-coach-backup
+[Unit]
+Description=Back up the study coach database
+
+[Service]
+Type=oneshot
+User=coach
+WorkingDirectory=/home/coach/study-coach
+ExecStart=/home/coach/study-coach/deploy/backup.sh
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/coach/study-coach /home/coach/backups

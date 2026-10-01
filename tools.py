@@ -96,7 +96,8 @@ def _free_on(ctx: Context, d: date, exclude: int | None = None) -> list[tuple[da
 
 def _check_block(ctx: Context, item: dict, start_s: str, end_s: str,
                  exclude: int | None = None) -> tuple[datetime, datetime]:
-    """Every hard rule for putting `item` in [start, end). Raises ToolError."""
+    """Every hard rule for putting `item` in [start, end), including Zak's track
+    blocks ("no Greek on weekend mornings"). Raises ToolError."""
     start, end = _parse(start_s, "start"), _parse(end_s, "end")
     now = _parse(ctx.now, "now")
     length = _minutes(start, end)
@@ -125,6 +126,12 @@ def _check_block(ctx: Context, item: dict, start_s: str, end_s: str,
     if used + length > _cap(ctx, start.date()):
         raise ToolError(f"daily cap is {_cap(ctx, start.date())} min and {used} min are "
                         f"already planned on {start.date()}; this adds {length}")
+
+    for b in db.blocks_on(ctx.conn, item["track_id"], start.date()):
+        if f"{start:%H:%M}" < b["end_time"] and f"{end:%H:%M}" > b["start_time"]:
+            raise ToolError(f"{item['track']} is blocked {b['start_time']}-{b['end_time']} on "
+                            f"{b['days']} (Zak: {b['reason'] or 'no reason given'}). Put a "
+                            f"different track there, or this one at another time.")
 
     if item["due_date"] and end.date() >= date.fromisoformat(item["due_date"]):
         raise ToolError(f"'{item['title']}' is due {item['due_date']}, so it must be "
